@@ -36,16 +36,13 @@ but some games still feel a bit off or cause a rumble pulsing feeling.
 
 ## Configuration
 
-At startup, TritonDriver looks for `tritonconfig.yml` at the root of each
-native USB mass-storage volume, then falls back to `Hdd1:\tritonconfig.yml`.
-It performs file I/O through the native kernel paths, so loading does not depend
-on dashboard drive aliases being visible to the system plugin. If no config
-exists, it creates a default file on the first writable USB, or on `Hdd1:` when
-no USB is writable. Restart the console or reload the plugin after editing the
-file.
+TritonDriver loads `tritonconfig.yml` from the root of a USB storage device or,
+if none is found, from `Hdd1:\tritonconfig.yml`. If the file does not exist, the
+driver creates one on the first writable USB device, with `Hdd1:` as a fallback.
+Restart the console after making changes.
 
-The generated config uses a cubic rumble response with maximum `2.0` gain as
-its global default and includes a Call of Duty: Black Ops II profile:
+The generated file contains the default settings and an example override for
+Call of Duty: Black Ops II:
 
 ```yaml
 version: 1
@@ -72,19 +69,23 @@ games:
       l5: b
 ```
 
-Game keys are eight-digit hexadecimal Xbox 360 Title IDs. An override inherits
-any omitted value from `defaults`, applies to every connected Triton while that
-title runs, and is removed when the title closes. Supported rumble curves are
-`linear`, `quadratic`, and `cubic`; gains range from `0.0` to `2.0`, and the
-deadzone ranges from `0.0` to `0.95`.
+Use `defaults` for settings that apply to every game. Entries under `games` use
+eight-digit hexadecimal Xbox 360 Title IDs and override only the values they
+contain. Game overrides apply to every connected Triton while that title is
+running.
 
-Paddles may be bound to `none`, `a`, `b`, `x`, `y`, `dpad_up`, `dpad_down`,
-`dpad_left`, `dpad_right`, `left_shoulder`, `right_shoulder`, `left_stick`,
-`right_stick`, `start`, `back`, `guide`, `left_trigger`, or `right_trigger`.
-The parser accepts the mapping-based YAML shown above; YAML sequences, anchors,
-and multiline scalar values are not supported. If an existing config is invalid,
-the driver logs its line number, leaves the file unchanged, and uses built-in
-defaults for that session.
+- `enabled` turns rumble on or off.
+- `left_gain` and `right_gain` accept values from `0.0` to `2.0`.
+- `deadzone` accepts values from `0.0` to `0.95`.
+- `curve` accepts `linear`, `quadratic`, or `cubic`.
+- `r4`, `r5`, `l4`, and `l5` may be set to `none`, `a`, `b`, `x`, `y`,
+  `dpad_up`, `dpad_down`, `dpad_left`, `dpad_right`, `left_shoulder`,
+  `right_shoulder`, `left_stick`, `right_stick`, `start`, `back`, `guide`,
+  `left_trigger`, or `right_trigger`.
+
+Keep the mapping-based YAML structure shown above. Sequences, anchors, and
+multiline values are not supported. If the file is invalid, the driver leaves
+it unchanged and uses its built-in defaults for that session.
 
 ## Current limitations
 
