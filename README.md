@@ -11,7 +11,7 @@ wireless puck (`28DE:1304`).
 ## Requirements
 
 - A modded Xbox 360 capable of loading XEX plugins.
-- Triton controllers and USB data cables, or one Valve Proteus wireless puck
+- Triton controllers and USB cable, or one Valve Proteus wireless puck
   with controllers already paired.
 
 TritonDriver does not manage pairing. Pair the controllers before connecting
@@ -21,7 +21,7 @@ the puck to the console.
 
 1. Download `tritondriver.xex` from [here](https://github.com/AustinJMann/tritondriver360/releases/latest) and copy it to the console.
 2. Load it at runtime or add it to the plugin list in `launch.ini`.
-3. Connect Triton controllers with USB data cables, or connect the Proteus puck
+3. Connect Triton controllers over USB, or connect the Proteus puck
    and power on its paired controllers.
 
 Each connected Triton is registered as a virtual Xbox 360 controller when an
@@ -94,9 +94,6 @@ it unchanged and uses its built-in defaults for that session.
 - Up to four direct USB controllers plus one Proteus puck can be attached;
   at most four virtual controllers can bind, subject to available XAM positions.
 - Bluetooth and BLE are unsupported.
-- Wired support requires the expected single HID interface and Triton reports.
-- Cable changes reconnect the controller and may change its player position.
-  Simultaneous USB/wireless streams from the same controller are not deduplicated.
 - No touch or IMU input.
 - Basic direct USB operation has been confirmed on hardware. Mixed wired/wireless
   use and four simultaneous physical Tritons still need hardware validation.
