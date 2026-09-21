@@ -1,7 +1,8 @@
 # TritonDriver
 
 TritonDriver is an Xbox 360 system plugin for Steam Controller 2026 (Triton)
-controllers connected through a Valve Proteus wireless puck (`28DE:1304`).
+controllers connected directly over USB (`28DE:1302`) or through a Valve Proteus
+wireless puck (`28DE:1304`).
 
 ```diff
 ! AI was heavily utilized in the creation of this driver.
@@ -10,8 +11,8 @@ controllers connected through a Valve Proteus wireless puck (`28DE:1304`).
 ## Requirements
 
 - A modded Xbox 360 capable of loading XEX plugins.
-- One Valve Proteus wireless puck.
-- One to four Triton controllers already paired.
+- Triton controllers and USB data cables, or one Valve Proteus wireless puck
+  with controllers already paired.
 
 TritonDriver does not manage pairing. Pair the controllers before connecting
 the puck to the console.
@@ -20,7 +21,8 @@ the puck to the console.
 
 1. Download `tritondriver.xex` from [here](https://github.com/AustinJMann/tritondriver360/releases/latest) and copy it to the console.
 2. Load it at runtime or add it to the plugin list in `launch.ini`.
-3. Connect the Proteus puck and power on the paired Triton controllers.
+3. Connect Triton controllers with USB data cables, or connect the Proteus puck
+   and power on its paired controllers.
 
 Each connected Triton is registered as a virtual Xbox 360 controller when an
 XAM player position is available. A connected slot that cannot bind immediately
@@ -89,10 +91,15 @@ it unchanged and uses its built-in defaults for that session.
 
 ## Current limitations
 
-- Triton-over-Proteus only; direct USB, Bluetooth, and BLE are unsupported.
-- One Proteus puck, with up to four paired controllers.
+- Up to four direct USB controllers plus one Proteus puck can be attached;
+  at most four virtual controllers can bind, subject to available XAM positions.
+- Bluetooth and BLE are unsupported.
+- Wired support requires the expected single HID interface and Triton reports.
+- Cable changes reconnect the controller and may change its player position.
+  Simultaneous USB/wireless streams from the same controller are not deduplicated.
 - No touch or IMU input.
-- Four simultaneous physical Tritons have not yet been hardware-validated.
+- Basic direct USB operation has been confirmed on hardware. Mixed wired/wireless
+  use and four simultaneous physical Tritons still need hardware validation.
 
 Other HID devices and non-slot Proteus interfaces are delegated to the Xbox 360
 USB stack and are not claimed by TritonDriver.

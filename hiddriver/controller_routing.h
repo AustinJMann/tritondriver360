@@ -2,11 +2,22 @@
 
 #include <stdint.h>
 
-namespace ProteusRouting {
+struct ControllerSourceToken {
+	uint32_t index;
+	uint32_t attachmentEpoch;
+};
 
-static const int kSlotCount = 4;
+namespace ControllerRouting {
+
+static const int kPuckSlotCount = 4;
+static const int kWiredSourceCount = 4;
+static const int kSlotCount = kPuckSlotCount + kWiredSourceCount;
 static const int kControllerCount = 4;
 static const int kUnboundController = -1;
+
+inline bool ReadyBefore(uint32_t first, uint32_t second) {
+	return (int32_t)(first - second) < 0;
+}
 
 inline bool IsValidSlotIndex(int slotIndex) {
 	return slotIndex >= 0 && slotIndex < kSlotCount;
@@ -30,4 +41,9 @@ inline bool GuidePressIsDue(uint32_t lastPressTime, uint32_t now,
 	return lastPressTime == 0 || (uint32_t)(now - lastPressTime) >= cooldownDuration;
 }
 
-} // namespace ProteusRouting
+inline bool TokenMatches(ControllerSourceToken token, uint32_t epoch) {
+	return IsValidSlotIndex((int)token.index) && token.attachmentEpoch != 0 &&
+		token.attachmentEpoch == epoch;
+}
+
+} // namespace ControllerRouting

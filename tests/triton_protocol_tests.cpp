@@ -11,7 +11,9 @@
 #include "../hiddriver/triton_config.h"
 
 #include "../hiddriver/triton_protocol.h"
-#include "../hiddriver/proteus_routing.h"
+#include "../hiddriver/controller_routing.h"
+#include "../hiddriver/controller_usb_policy.h"
+#include "../hiddriver/triton_hid_descriptor.h"
 #include "../hiddriver/usb_descriptors.h"
 
 using namespace TritonProtocol;
@@ -32,18 +34,18 @@ struct SimController {
 };
 
 struct RoutingSimulation {
-	SimSlot slots[ProteusRouting::kSlotCount];
-	SimController controllers[ProteusRouting::kControllerCount];
-	bool rejectBind[ProteusRouting::kSlotCount];
+	SimSlot slots[ControllerRouting::kSlotCount];
+	SimController controllers[ControllerRouting::kControllerCount];
+	bool rejectBind[ControllerRouting::kSlotCount];
 
 	RoutingSimulation() { Reset(); }
 
 	void Reset() {
 		memset(this, 0, sizeof(*this));
-		for (int i = 0; i < ProteusRouting::kSlotCount; ++i) {
-			slots[i].controllerIndex = ProteusRouting::kUnboundController;
+		for (int i = 0; i < ControllerRouting::kSlotCount; ++i) {
+			slots[i].controllerIndex = ControllerRouting::kUnboundController;
 			slots[i].generation = 1;
-			controllers[i].slotIndex = -1;
+			if (i < ControllerRouting::kControllerCount) controllers[i].slotIndex = -1;
 		}
 	}
 
@@ -58,7 +60,7 @@ struct RoutingSimulation {
 	}
 
 	void Process() {
-		for (int slotIndex = 0; slotIndex < ProteusRouting::kSlotCount; ++slotIndex) {
+		for (int slotIndex = 0; slotIndex < ControllerRouting::kSlotCount; ++slotIndex) {
 			SimSlot& slot = slots[slotIndex];
 			bool disconnectPending = slot.disconnectPending;
 			slot.disconnectPending = false;
@@ -66,15 +68,15 @@ struct RoutingSimulation {
 				SimController& controller = controllers[slot.controllerIndex];
 				controller.occupied = false;
 				controller.slotIndex = -1;
-				slot.controllerIndex = ProteusRouting::kUnboundController;
+				slot.controllerIndex = ControllerRouting::kUnboundController;
 				++slot.generation;
 			}
 		}
-		for (int slotIndex = 0; slotIndex < ProteusRouting::kSlotCount; ++slotIndex) {
+		for (int slotIndex = 0; slotIndex < ControllerRouting::kSlotCount; ++slotIndex) {
 			SimSlot& slot = slots[slotIndex];
 			if (!slot.connected || slot.controllerIndex >= 0) continue;
 			int freeController = -1;
-			for (int i = 0; i < ProteusRouting::kControllerCount; ++i) {
+			for (int i = 0; i < ControllerRouting::kControllerCount; ++i) {
 				if (!controllers[i].occupied) { freeController = i; break; }
 			}
 			if (freeController < 0) continue;
@@ -86,7 +88,7 @@ struct RoutingSimulation {
 			if (rejectBind[slotIndex]) {
 				controller.occupied = false;
 				controller.slotIndex = -1;
-				slot.controllerIndex = ProteusRouting::kUnboundController;
+				slot.controllerIndex = ControllerRouting::kUnboundController;
 				++slot.generation;
 			}
 		}
@@ -96,7 +98,7 @@ struct RoutingSimulation {
 		SimController& controller = controllers[controllerIndex];
 		if (controller.slotIndex < 0) return false;
 		SimSlot& slot = slots[controller.slotIndex];
-		if (!ProteusRouting::AssociationMatches(slot.connected,
+		if (!ControllerRouting::AssociationMatches(slot.connected,
 			slot.controllerIndex, slot.generation, controller.occupied,
 			controller.slotIndex, controller.generation, controllerIndex))
 			return false;
@@ -476,10 +478,10 @@ static void TestRoutingDisconnectRetryAndGeneration() {
 }
 
 static void TestRoutingFailuresAndIsolation() {
-	assert(ProteusRouting::IsValidXamBinding(0, 0));
-	assert(ProteusRouting::IsValidXamBinding(0, 3));
-	assert(!ProteusRouting::IsValidXamBinding(-1, 0));
-	assert(!ProteusRouting::IsValidXamBinding(0, 4));
+	assert(ControllerRouting::IsValidXamBinding(0, 0));
+	assert(ControllerRouting::IsValidXamBinding(0, 3));
+	assert(!ControllerRouting::IsValidXamBinding(-1, 0));
+	assert(!ControllerRouting::IsValidXamBinding(0, 4));
 	RoutingSimulation simulation;
 	simulation.rejectBind[1] = true;
 	simulation.Connect(0, 10);
@@ -528,10 +530,10 @@ static void TestRoutingRemovalOrdersAndGuideDebounce() {
 					}
 				}
 	assert(permutations == 24);
-	assert(ProteusRouting::GuidePressIsDue(0, 10, 1000));
-	assert(!ProteusRouting::GuidePressIsDue(100, 1099, 1000));
-	assert(ProteusRouting::GuidePressIsDue(100, 1100, 1000));
-	assert(ProteusRouting::GuidePressIsDue(0xfffffff0u, 0x000003e0u, 1000));
+	assert(ControllerRouting::GuidePressIsDue(0, 10, 1000));
+	assert(!ControllerRouting::GuidePressIsDue(100, 1099, 1000));
+	assert(ControllerRouting::GuidePressIsDue(100, 1100, 1000));
+	assert(ControllerRouting::GuidePressIsDue(0xfffffff0u, 0x000003e0u, 1000));
 }
 
 static void TestControllerCapabilities() {
@@ -812,7 +814,75 @@ static void TestRumbleWrapAndSlotIsolation() {
 	}
 }
 
+static void TestWiredAdmissionAndSourceCapacity() {
+	using namespace ControllerUsbPolicy;
+	usb_interface_descriptor d = { 9, 4, 0, 0, 2, 3, 0, 0, 0 };
+	assert(Classify(0x28de, 0x1302, &d) == kWiredTriton);
+	assert(Classify(0x28de, 0x1303, &d) == kUnsupported);
+	assert(Classify(0x28de, 0x1305, &d) == kUnsupported);
+	assert(Classify(0x1234, 0x1302, &d) == kUnsupported);
+	d.bAlternateSetting = 1; assert(Classify(0x28de, 0x1302, &d) == kUnsupported);
+	d.bAlternateSetting = 0; d.bInterfaceSubClass = 1;
+	assert(Classify(0x28de, 0x1302, &d) == kUnsupported);
+	d.bInterfaceSubClass = 0; d.bInterfaceProtocol = 1;
+	assert(Classify(0x28de, 0x1302, &d) == kUnsupported);
+	d.bInterfaceProtocol = 0; d.bInterfaceNumber = 2;
+	assert(Classify(0x28de, 0x1304, &d) == kProteus);
+	d.bLength = 8; assert(Classify(0x28de, 0x1304, &d) == kUnsupported);
+	assert(!ShouldPauseHeartbeat(kWiredTriton, false, 255));
+	assert(ShouldPauseHeartbeat(kProteus, false, 3));
+	assert(InputLength(65, 64) == 0 && InputLength(3, 64) == 3);
+	ControllerSourceToken token = { 7, 25 };
+	assert(ControllerRouting::TokenMatches(token, 25));
+	assert(!ControllerRouting::TokenMatches(token, 26));
+	token.index = 8; assert(!ControllerRouting::TokenMatches(token, 25));
+	token.index = 0; token.attachmentEpoch = 0;
+	assert(!ControllerRouting::TokenMatches(token, 0));
+	assert(ControllerRouting::ReadyBefore(0xfffffff0u, 3));
+	RoutingSimulation simulation;
+	// Four wired sources can bind while every empty puck slot stays unbound.
+	for (int i = 4; i < 8; ++i) simulation.Connect(i, (uint32_t)i);
+	simulation.Process();
+	for (int i = 0; i < 4; ++i) assert(simulation.slots[i + 4].controllerIndex == i);
+	for (int i = 0; i < 4; ++i) simulation.Connect(i, (uint32_t)i);
+	simulation.Process();
+	for (int i = 0; i < 4; ++i) assert(simulation.slots[i].controllerIndex == -1);
+	simulation.Disconnect(5); simulation.Process();
+	assert(simulation.slots[0].controllerIndex == 1);
+	assert(simulation.slots[4].controllerIndex == 0);
+}
+
+static void TestTritonHidDescriptors() {
+	const uint8_t hid[] = {
+		0x06, 0, 0xff, 0x09, 1, 0xa1, 1, 0x75, 8,
+		0x85, 0x42, 0x95, 63, 0x81, 2,
+		0x85, 1, 0x95, 63, 0xb1, 2,
+		0x85, 0x80, 0x95, 9, 0x91, 2, 0xc0
+	};
+	assert(TritonHidDescriptor::Validate(hid, sizeof(hid)));
+	for (size_t i = 0; i < sizeof(hid); ++i) assert(!TritonHidDescriptor::Validate(hid, i));
+	uint8_t bad[sizeof(hid)]; memcpy(bad, hid, sizeof(hid));
+	bad[18] = 62; assert(!TritonHidDescriptor::Validate(bad, sizeof(bad)));
+	memcpy(bad, hid, sizeof(hid)); bad[22] = 0x81;
+	assert(!TritonHidDescriptor::Validate(bad, sizeof(bad)));
+	memcpy(bad, hid, sizeof(hid)); bad[10] = 0;
+	assert(!TritonHidDescriptor::Validate(bad, sizeof(bad)));
+	memcpy(bad, hid, sizeof(hid)); bad[0] = 0xfe;
+	assert(!TritonHidDescriptor::Validate(bad, sizeof(bad)));
+	const uint8_t configuration[] = {
+		9, 2, 27, 0, 1, 1, 0, 0x80, 50,
+		9, 4, 0, 0, 1, 3, 0, 0, 0,
+		9, 0x21, 0x11, 1, 0, 1, 0x22, 0x74, 1
+	};
+	assert(UsbDescriptors::HidReportLength(configuration, sizeof(configuration), 0) == 372);
+	assert(UsbDescriptors::HidReportLength(configuration, sizeof(configuration), 1) == 0);
+	for (size_t i = 0; i < sizeof(configuration); ++i)
+		assert(UsbDescriptors::HidReportLength(configuration, i, 0) == 0);
+}
+
 int main() {
+	TestWiredAdmissionAndSourceCapacity();
+	TestTritonHidDescriptors();
 	TestUsbOutputDescriptors();
 	TestRumbleXamDispatch();
 	TestRumbleDeadzoneAndCubicScaling();

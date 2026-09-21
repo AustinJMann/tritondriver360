@@ -6,6 +6,7 @@
 namespace TritonProtocol {
 
 static const uint16_t kValveVendorId = 0x28DE;
+static const uint16_t kTritonUsbProductId = 0x1302;
 static const uint16_t kProteusProductId = 0x1304;
 static const uint8_t kFirstSlotInterface = 2;
 static const uint8_t kLastSlotInterface = 5;

@@ -3,19 +3,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "proteus.h"
+#include "controller_usb.h"
+#include "triton_hid_descriptor.h"
 #include "triton_protocol.h"
 #include "rumble_output.h"
 #include "usb_descriptors.h"
 
-typedef usb_endpoint_descriptor* (*EndpointDescriptorFn)(deviceHandle*, int, int, int);
 typedef int (*AddCompleteFn)(deviceHandle*, int);
 typedef int (*QueueTransferFn)(deviceHandle*, void*);
 typedef NTSTATUS (*OpenDefaultEndpointFn)(deviceHandle*, DWORD*);
 typedef NTSTATUS (*OpenEndpointFn)(deviceHandle*, int, int, int, int, DWORD*);
 typedef NTSTATUS (*RemoveCompleteFn)(deviceHandle*);
 
-extern EndpointDescriptorFn UsbdGetEndpointDescriptor;
 extern AddCompleteFn UsbdAddDeviceComplete;
 extern QueueTransferFn UsbdQueueAsyncTransfer;
 extern OpenDefaultEndpointFn UsbdOpenDefaultEndpoint;
@@ -24,17 +23,20 @@ extern RemoveCompleteFn UsbdRemoveDeviceComplete;
 
 namespace {
 
-static const int kSlotCount = 4;
+static const int kSlotCount = ControllerRouting::kSlotCount;
 static const uint32_t kHeartbeatIntervalMs = 2000;
 static const uint32_t kHeartbeatRetryMs = 250;
 static const uint32_t kInputRetryMs = 50;
 static const uint32_t kRemovalGraceMs = 1000;
 static const uint16_t kMaxHidPacketSize = 64;
-static const uint16_t kConfigurationDescriptorBufferSize = 512;
+static const uint16_t kConfigurationDescriptorBufferSize = 1024;
 
 enum ControlPurpose {
 	kControlNone,
 	kControlGetConfigurationDescriptor,
+	kControlGetConfigurationHeader,
+	kControlGetHidDescriptor,
+	kControlGetCurrentConfiguration,
 	kControlSetConfiguration,
 	kControlLizardOff,
 	kControlRumble
@@ -54,14 +56,36 @@ static_assert(offsetof(RumbleTransfer, transferredBytes) == 0x1c,
 static_assert(offsetof(RumbleTransfer, report) == 0x20,
 	"Output report overlaps USB transfer bookkeeping");
 
-struct ProteusSlot {
+struct UsbDeviceContext {
+	bool configured;
+	bool configurationBusy;
+	bool descriptorFetched;
+	bool currentConfigurationKnown;
+	bool hidValidated;
+	bool failed;
+	uint8_t currentConfiguration;
+	uint16_t descriptorLength;
+	uint16_t hidLength;
+	uint32_t retryAt;
+	volatile LONG controlOwner;
+	uint8_t descriptor[kConfigurationDescriptorBufferSize];
+	uint8_t hidDescriptor[kConfigurationDescriptorBufferSize];
+};
+struct ControlReports {
+	uint8_t feature[TritonProtocol::kFeatureReportSize];
+	uint8_t rumble[TritonProtocol::kRumbleReportSize];
+};
+struct UsbSource {
+	UsbDeviceContext* device;
+	ControllerUsbPolicy::Kind kind;
+	ControllerSourceToken token;
+	usb_endpoint_descriptor outputDescriptor;
 	deviceHandle* handle;
-	ProteusControllerExtension* extension;
+	UsbControllerExtension* extension;
 	uint8_t interfaceNumber;
 	uint8_t* inputBuffer;
 	uint16_t inputLength;
-	uint8_t featureReport[TritonProtocol::kFeatureReportSize];
-	uint8_t rumbleReport[TritonProtocol::kRumbleReportSize];
+	ControlReports* reports;
 	RumbleOutput::State rumble;
 	RumbleTransfer* output;
 	uint8_t outputEndpoint;
@@ -92,43 +116,31 @@ struct ProteusSlot {
 	uint32_t cleanupDeadline;
 };
 
-static ProteusSlot g_slots[kSlotCount];
-static bool g_configurationBusy;
-static bool g_configured;
-static bool g_configurationDescriptorFetched;
-static volatile LONG g_controlOwnerSlot = -1;
+static UsbSource g_slots[kSlotCount];
+static UsbDeviceContext* g_puckDevice;
 static int g_nextHeartbeatSlot;
 static int g_nextRumbleSlot;
 static bool g_dispatchingOutputs;
-static uint8_t g_configurationDescriptor[kConfigurationDescriptorBufferSize];
-static usb_endpoint_descriptor g_slotEndpointDescriptors[kSlotCount];
-static usb_endpoint_descriptor g_slotOutputDescriptors[kSlotCount];
-
+static bool g_initializing;
 static uint16_t Swap16(uint16_t value) {
 	return (uint16_t)((value >> 8) | (value << 8));
 }
 
-static ProteusSlot* FindSlotByInterface(uint8_t interfaceNumber) {
-	if (interfaceNumber < TritonProtocol::kFirstSlotInterface ||
-		interfaceNumber > TritonProtocol::kLastSlotInterface)
-		return 0;
-	return &g_slots[interfaceNumber - TritonProtocol::kFirstSlotInterface];
-}
-
-static ProteusSlot* FindSlotByHandle(deviceHandle* handle) {
+static UsbSource* FindSlotByHandle(deviceHandle* handle) {
+	if (!handle) return 0;
 	for (int i = 0; i < kSlotCount; ++i)
 		if (g_slots[i].handle == handle) return &g_slots[i];
 	return 0;
 }
 
-static int32_t QueueInput(ProteusSlot* slot);
+static int32_t QueueInput(UsbSource* slot);
 static int32_t InputComplete(DWORD trbAddress, int32_t status);
 static int32_t ControlComplete(DWORD trbAddress, int32_t status);
 static int32_t OutputComplete(DWORD trbAddress, int32_t status);
 static void StartNextConfiguration();
 static void DispatchOutputs(uint32_t now);
 
-static void UpdateRemovalReady(ProteusSlot* slot) {
+static void UpdateRemovalReady(UsbSource* slot) {
 	if (!slot || !slot->removing || !slot->removeCompleteCalled)
 		return;
 	if (!slot->cleanupReady) {
@@ -138,42 +150,31 @@ static void UpdateRemovalReady(ProteusSlot* slot) {
 	}
 }
 
-static void FinalizeRemoval(ProteusSlot* slot) {
-	if (!slot || !slot->cleanupReady)
-		return;
-	uint8_t interfaceNumber = slot->interfaceNumber;
-	// The Xbox USB stack may retain the closed TRB after delivering its cancel
-	// callback. Remove live lookup keys, but quarantine the small allocation for
-	// the remainder of this driver session instead of risking a use-after-free.
+static void FinalizeRemoval(UsbSource* slot) {
+	if (!slot || !slot->cleanupReady || !ControllerSourceRetired(slot->token)) return;
+	UsbDeviceContext* device = slot->device;
+	// A surviving puck interface still shares this arbiter. Its old owner must
+	// complete before that source index can be reused on the same context.
+	if (slot->controlBusy)
+		for (int i = 0; i < kSlotCount; ++i)
+			if (g_slots[i].handle && !g_slots[i].removing && g_slots[i].device == device) return;
+	// Retain TRBs, payloads, and device buffers for late kernel accesses.
+	// New attachments always receive new allocations and callback addresses.
 	memset(slot, 0, sizeof(*slot));
 	MemoryBarrier();
-	DbgPrint("TritonDriver: Proteus interface %d removal complete; USB storage quarantined\n",
-		interfaceNumber);
-	bool anySlotsRemain = false;
 	for (int i = 0; i < kSlotCount; ++i)
-		if (g_slots[i].handle) anySlotsRemain = true;
-	if (!anySlotsRemain) {
-		g_configurationBusy = false;
-		g_configured = false;
-		g_configurationDescriptorFetched = false;
-		InterlockedExchange(&g_controlOwnerSlot, -1);
-		g_nextHeartbeatSlot = 0;
-		g_nextRumbleSlot = 0;
-		memset(g_configurationDescriptor, 0, sizeof(g_configurationDescriptor));
-		memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
-		memset(g_slotOutputDescriptors, 0, sizeof(g_slotOutputDescriptors));
-	}
+		if (g_slots[i].handle && g_slots[i].device == device) return;
+	if (g_puckDevice == device) g_puckDevice = 0;
 }
 
-static bool QueueControl(ProteusSlot* slot, ControlPurpose purpose,
+static bool QueueControl(UsbSource* slot, ControlPurpose purpose,
 	uint8_t requestType, uint8_t request, uint16_t value,
 	uint16_t index, uint16_t length, void* data) {
 	if (!slot || slot->removing || slot->controlBusy) return false;
 	int slotIndex = (int)(slot - g_slots);
 	if (slotIndex < 0 || slotIndex >= kSlotCount) return false;
-	// All interface handles share the puck's physical endpoint zero. Allow only
-	// one configuration/feature transfer across the entire puck at a time.
-	if (InterlockedCompareExchange(&g_controlOwnerSlot, slotIndex, -1) != -1)
+	// Puck slots share endpoint zero; separate wired attachments do not.
+	if (InterlockedCompareExchange(&slot->device->controlOwner, slotIndex, -1) != -1)
 		return false;
 	UsbControlTrb* control = &slot->extension->controlTrb;
 	control->packet.bmRequestType = requestType;
@@ -183,6 +184,7 @@ static bool QueueControl(ProteusSlot* slot, ControlPurpose purpose,
 	control->packet.wLength = Swap16(length);
 	control->trb.buffer = data;
 	control->trb.length = length;
+	control->transferredBytes = 0;
 	slot->controlBusy = true;
 	slot->controlPurpose = purpose;
 	// This API returns an opaque queue token, which may have its high bit set;
@@ -190,23 +192,23 @@ static bool QueueControl(ProteusSlot* slot, ControlPurpose purpose,
 	int queueToken = UsbdQueueAsyncTransfer(slot->handle, control);
 	if (!slot->loggedControlQueueResult) {
 		slot->loggedControlQueueResult = true;
-		DbgPrint("TritonDriver: Proteus slot %d control transfer queued token %x request %02x value %04x\n",
-			slot->interfaceNumber, queueToken, request, value);
+		DbgPrint("TritonDriver: USB source %u control transfer queued token %x request %02x value %04x\n",
+			slot->token.index, queueToken, request, value);
 	}
 	return true;
 }
 
-static bool QueueLizardOff(ProteusSlot* slot) {
-	if (slot->controlBusy || g_controlOwnerSlot != -1) return false;
-	TritonProtocol::BuildLizardOffFeatureReport(slot->featureReport);
+static bool QueueLizardOff(UsbSource* slot) {
+	if (slot->controlBusy || slot->device->controlOwner != -1) return false;
+	TritonProtocol::BuildLizardOffFeatureReport(slot->reports->feature);
 	return QueueControl(slot, kControlLizardOff, 0x21, 0x09, 0x0301, slot->interfaceNumber,
-		TritonProtocol::kFeatureReportSize, slot->featureReport);
+		TritonProtocol::kFeatureReportSize, slot->reports->feature);
 }
 
-static bool QueueRumble(ProteusSlot* slot, uint32_t now) {
+static bool QueueRumble(UsbSource* slot, uint32_t now) {
 	if (slot->removing || !slot->rumble.Due(now)) return false;
-	if (!slot->output && (slot->controlBusy || g_controlOwnerSlot != -1)) return false;
-	uint8_t* report = slot->output ? slot->output->report : slot->rumbleReport;
+	if (!slot->output && (slot->controlBusy || slot->device->controlOwner != -1)) return false;
+	uint8_t* report = slot->output ? slot->output->report : slot->reports->rumble;
 	TritonProtocol::BuildRumbleOutputReport(RumbleOutput::Left(slot->rumble.desired),
 		RumbleOutput::Right(slot->rumble.desired), report);
 	// Mark pending before queueing: completion may run before the API returns.
@@ -226,49 +228,22 @@ static bool QueueRumble(ProteusSlot* slot, uint32_t now) {
 	return false;
 }
 
-static ProteusSlot* FindSlotByInterruptTrb(void* trb) {
+static UsbSource* FindSlotByInterruptTrb(void* trb) {
 	for (int i = 0; i < kSlotCount; ++i)
 		if (g_slots[i].extension && &g_slots[i].extension->interruptTrb == trb)
 			return &g_slots[i];
 	return 0;
 }
 
-static ProteusSlot* FindSlotByControlTrb(void* trb) {
+static UsbSource* FindSlotByControlTrb(void* trb) {
 	for (int i = 0; i < kSlotCount; ++i)
 		if (g_slots[i].extension && &g_slots[i].extension->controlTrb == trb)
 			return &g_slots[i];
 	return 0;
 }
 
-static void ParseConfigurationDescriptor() {
-	memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
-	memset(g_slotOutputDescriptors, 0, sizeof(g_slotOutputDescriptors));
-	for (int i = 0; i < kSlotCount; ++i) {
-		uint8_t interfaceNumber = (uint8_t)(TritonProtocol::kFirstSlotInterface + i);
-		usb_endpoint_descriptor* endpoint = &g_slotEndpointDescriptors[i];
-		if (UsbDescriptors::FindInterruptInEndpoint(g_configurationDescriptor,
-			sizeof(g_configurationDescriptor), interfaceNumber, endpoint)) {
-			DbgPrint("TritonDriver: Proteus configuration maps interface %d to endpoint %02x size %d interval %d\n",
-				interfaceNumber, endpoint->bEndpointAddress,
-				TritonProtocol::ReadLE16((const uint8_t*)&endpoint->wMaxPacketSize),
-				endpoint->bInterval);
-		}
-		endpoint = &g_slotOutputDescriptors[i];
-		if (UsbDescriptors::FindInterruptOutEndpoint(g_configurationDescriptor,
-			sizeof(g_configurationDescriptor), interfaceNumber, endpoint)) {
-			DbgPrint("TritonDriver: Proteus interface %d advertises interrupt-OUT %02x size %d interval %d\n",
-				interfaceNumber, endpoint->bEndpointAddress,
-				TritonProtocol::ReadLE16((const uint8_t*)&endpoint->wMaxPacketSize), endpoint->bInterval);
-		} else {
-			DbgPrint("TritonDriver: Proteus interface %d no interrupt-OUT found in configuration (total %d)\n",
-				interfaceNumber, TritonProtocol::ReadLE16(g_configurationDescriptor + 2));
-		}
-	}
-}
-
-static void OpenRumbleEndpoint(ProteusSlot* slot) {
-	const usb_endpoint_descriptor& endpoint = g_slotOutputDescriptors[
-		slot->interfaceNumber - TritonProtocol::kFirstSlotInterface];
+static void OpenRumbleEndpoint(UsbSource* slot) {
+	const usb_endpoint_descriptor& endpoint = slot->outputDescriptor;
 	if (!UsbDescriptors::IsInterruptOutEndpoint(endpoint)) return;
 	uint16_t packetSize = TritonProtocol::ReadLE16((const uint8_t*)&endpoint.wMaxPacketSize) & 0x7ff;
 	if (packetSize < TritonProtocol::kRumbleReportSize || packetSize > kMaxHidPacketSize) {
@@ -295,32 +270,19 @@ static void OpenRumbleEndpoint(ProteusSlot* slot) {
 		slot->interfaceNumber, slot->outputEndpoint);
 }
 
-static bool StartListening(ProteusSlot* slot) {
-	int slotIndex = slot->interfaceNumber - TritonProtocol::kFirstSlotInterface;
-	if (slotIndex >= 0 && slotIndex < kSlotCount && g_slotEndpointDescriptors[slotIndex].bLength)
-		memcpy(&slot->endpointDescriptor, &g_slotEndpointDescriptors[slotIndex], sizeof(slot->endpointDescriptor));
+static bool StartListening(UsbSource* slot) {
+	UsbDescriptors::FindInterruptInEndpoint(slot->device->descriptor,
+		slot->device->descriptorLength, slot->interfaceNumber, &slot->endpointDescriptor);
+	UsbDescriptors::FindInterruptOutEndpoint(slot->device->descriptor,
+		slot->device->descriptorLength, slot->interfaceNumber, &slot->outputDescriptor);
 	usb_endpoint_descriptor* endpoint = &slot->endpointDescriptor;
-	if (endpoint->bLength == 0) {
-		usb_endpoint_descriptor* indexed = UsbdGetEndpointDescriptor(
-			slot->handle, slot->interfaceNumber, 3, 1);
-		if (indexed) {
-			memcpy(&slot->endpointDescriptor, indexed, UsbDescriptors::kEndpointDescriptorSize);
-			DbgPrint("TritonDriver: Proteus interface %d indexed endpoint %02x descriptor %p\n",
-				slot->interfaceNumber, indexed->bEndpointAddress, indexed);
-		} else {
-			usb_endpoint_descriptor* fallback = UsbdGetEndpointDescriptor(slot->handle, 0, 3, 1);
-			if (fallback) memcpy(&slot->endpointDescriptor, fallback, UsbDescriptors::kEndpointDescriptorSize);
-			DbgPrint("TritonDriver: Proteus interface %d indexed lookup failed; fallback endpoint %02x\n",
-				slot->interfaceNumber, fallback ? fallback->bEndpointAddress : 0);
-		}
-	}
 	if (!UsbDescriptors::IsInterruptInEndpoint(*endpoint)) {
-		DbgPrint("TritonDriver: Proteus interface %d has no interrupt-IN endpoint\n", slot->interfaceNumber);
+		DbgPrint("TritonDriver: USB interface %d has no interrupt-IN endpoint\n", slot->interfaceNumber);
 		return false;
 	}
-	uint16_t packetSize = Swap16(endpoint->wMaxPacketSize) & 0x7ff;
+	uint16_t packetSize = TritonProtocol::ReadLE16((const uint8_t*)&endpoint->wMaxPacketSize) & 0x7ff;
 	if (packetSize == 0 || packetSize > kMaxHidPacketSize) {
-		DbgPrint("TritonDriver: Proteus interface %d invalid packet size %d\n", slot->interfaceNumber, packetSize);
+		DbgPrint("TritonDriver: USB interface %d invalid packet size %d\n", slot->interfaceNumber, packetSize);
 		return false;
 	}
 	slot->inputBuffer = (uint8_t*)calloc(1, packetSize);
@@ -343,56 +305,60 @@ static bool StartListening(ProteusSlot* slot) {
 	inputTrb->savedEndpoint = inputTrb->endpoint;
 	OpenRumbleEndpoint(slot);
 	slot->listening = true;
-	DbgPrint("TritonDriver: Proteus slot interface %d listening endpoint %02x size %d interval %d\n",
+	DbgPrint("TritonDriver: USB interface %d listening endpoint %02x size %d interval %d\n",
 		slot->interfaceNumber, endpoint->bEndpointAddress, packetSize, endpoint->bInterval);
-	QueueInput(slot);
-	// Do not probe empty bond slots on the puck-wide control endpoint. Wireless
-	// activity below enables raw mode for the specific slot that needs it.
-	slot->heartbeatEnabled = false;
+	// Wired devices need raw mode before their first state report.
+	slot->heartbeatEnabled = slot->kind == ControllerUsbPolicy::kWiredTriton;
 	slot->heartbeatDeadline = 0;
+	QueueInput(slot);
 	return true;
 }
 
 static void StartNextConfiguration() {
-	if (g_configurationBusy) return;
-	if (!g_configurationDescriptorFetched) {
-		for (int i = 0; i < kSlotCount; ++i) {
-			ProteusSlot* slot = &g_slots[i];
-			if (slot->handle && slot->configurationPending && !slot->removing) {
-				memset(g_configurationDescriptor, 0, sizeof(g_configurationDescriptor));
-				if (QueueControl(slot, kControlGetConfigurationDescriptor,
-					0x80, 0x06, 0x0200, 0, kConfigurationDescriptorBufferSize,
-					g_configurationDescriptor))
-					g_configurationBusy = true;
-				return;
-			}
-		}
-	}
-	if (g_configured) {
-		for (int i = 0; i < kSlotCount; ++i) {
-			ProteusSlot* slot = &g_slots[i];
-			if (slot->handle && slot->configurationPending && !slot->removing) {
-				slot->configurationPending = false;
-				if (!StartListening(slot))
-					DbgPrint("TritonDriver: Proteus slot %d endpoint initialization failed\n", slot->interfaceNumber);
-			}
-		}
-		return;
-	}
+	if (g_initializing) return;
+	g_initializing = true;
+	uint32_t now = GetTickCount();
 	for (int i = 0; i < kSlotCount; ++i) {
-		ProteusSlot* slot = &g_slots[i];
-		if (slot->handle && slot->configurationPending && !slot->removing) {
-			if (QueueControl(slot, kControlSetConfiguration, 0x00, 0x09, 1, 0, 0, 0)) {
-				slot->configurationPending = false;
-				g_configurationBusy = true;
-			}
-			return;
+		UsbSource* slot = &g_slots[i];
+		if (!slot->handle || slot->removing || !slot->configurationPending) continue;
+		UsbDeviceContext* device = slot->device;
+		if (device->failed || device->configurationBusy || device->controlOwner != -1 ||
+			(device->retryAt && (int32_t)(now - device->retryAt) < 0)) continue;
+		ControlPurpose purpose = kControlNone;
+		uint8_t type = 0x80, request = 6;
+		uint16_t value = 0x0200, index = 0, length = 0;
+		void* buffer = device->descriptor;
+		if (!device->descriptorLength) {
+			purpose = kControlGetConfigurationHeader;
+			length = 9;
+		} else if (!device->descriptorFetched) {
+			purpose = kControlGetConfigurationDescriptor;
+			length = device->descriptorLength;
+		} else if (slot->kind == ControllerUsbPolicy::kWiredTriton && !device->hidValidated) {
+			purpose = kControlGetHidDescriptor;
+			type = 0x81; value = 0x2200; index = slot->interfaceNumber;
+			length = device->hidLength; buffer = device->hidDescriptor;
+		} else if (!device->currentConfigurationKnown) {
+			purpose = kControlGetCurrentConfiguration;
+			request = 8; value = 0; length = 1; buffer = &device->currentConfiguration;
+		} else if (!device->configured) {
+			purpose = kControlSetConfiguration;
+			type = 0; request = 9; value = device->descriptor[5]; buffer = 0;
+		} else {
+			if (StartListening(slot)) slot->configurationPending = false;
+			else device->retryAt = now + kHeartbeatRetryMs;
+			continue;
 		}
+		// Set ownership before queueing; the kernel may complete inline.
+		device->configurationBusy = true;
+		if (!QueueControl(slot, purpose, type, request, value, index, length, buffer))
+			device->configurationBusy = false;
 	}
+	g_initializing = false;
 }
 
-static void FinishRumble(ProteusSlot* slot, int32_t status, uint32_t now) {
-	slot->rumble.Update(ProteusReadRumbleRequest(slot->interfaceNumber));
+static void FinishRumble(UsbSource* slot, int32_t status, uint32_t now) {
+	slot->rumble.Update(ControllerReadRumbleRequest(slot->token));
 	slot->rumble.Complete(status == 0, now);
 	if (status != 0 && slot->rumble.failures <= 3) {
 		DbgPrint("TritonDriver: rumble USB failed interface %d left %u right %u status %x elapsed %u ms\n",
@@ -402,8 +368,9 @@ static void FinishRumble(ProteusSlot* slot, int32_t status, uint32_t now) {
 }
 
 static int32_t OutputComplete(DWORD trbAddress, int32_t status) {
+	uint32_t now = GetTickCount();
 	for (int i = 0; i < kSlotCount; ++i) {
-		ProteusSlot* slot = &g_slots[i];
+		UsbSource* slot = &g_slots[i];
 		if (!slot->output || &slot->output->trb != (void*)trbAddress) continue;
 		if (slot->removing) {
 			slot->rumble.pending = false;
@@ -411,7 +378,6 @@ static int32_t OutputComplete(DWORD trbAddress, int32_t status) {
 			return status;
 		}
 		if (!slot->rumble.pending) return status;
-		uint32_t now = GetTickCount();
 		FinishRumble(slot, status, now);
 		DispatchOutputs(now);
 		return status;
@@ -420,49 +386,74 @@ static int32_t OutputComplete(DWORD trbAddress, int32_t status) {
 }
 
 static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
-	ProteusSlot* slot = FindSlotByControlTrb((void*)trbAddress);
+	uint32_t now = GetTickCount();
+	UsbSource* slot = FindSlotByControlTrb((void*)trbAddress);
 	if (!slot) return status;
 	int slotIndex = (int)(slot - g_slots);
-	InterlockedCompareExchange(&g_controlOwnerSlot, -1, slotIndex);
+	InterlockedCompareExchange(&slot->device->controlOwner, -1, slotIndex);
 	ControlPurpose purpose = slot->controlPurpose;
 	slot->controlPurpose = kControlNone;
 	if (slot->removing) {
 		slot->controlBusy = false;
+		if (purpose != kControlRumble && purpose != kControlLizardOff)
+			slot->device->configurationBusy = false;
 		UpdateRemovalReady(slot);
 		return status;
 	}
 	if (purpose == kControlRumble) {
-		uint32_t now = GetTickCount();
 		FinishRumble(slot, status, now);
 		slot->controlBusy = false;
 		StartNextConfiguration();
 		DispatchOutputs(now);
 		return status;
 	}
-	if (purpose == kControlGetConfigurationDescriptor) {
-		g_configurationBusy = false;
-		if (status == 0) {
-			ParseConfigurationDescriptor();
-		} else {
-			DbgPrint("TritonDriver: Proteus configuration descriptor request failed: %x\n", status);
-		}
-		g_configurationDescriptorFetched = true;
+	if (purpose == kControlGetConfigurationHeader || purpose == kControlGetConfigurationDescriptor ||
+		purpose == kControlGetHidDescriptor || purpose == kControlGetCurrentConfiguration ||
+		purpose == kControlSetConfiguration) {
+		UsbDeviceContext* device = slot->device;
+		device->configurationBusy = false;
+		device->retryAt = 0;
+		uint32_t length = slot->extension->controlTrb.transferredBytes;
+		if (status != 0) {
+			device->retryAt = now + kHeartbeatRetryMs;
+		} else if (purpose == kControlGetConfigurationHeader) {
+			uint16_t total = TritonProtocol::ReadLE16(device->descriptor + 2);
+			if (length != 9 || device->descriptor[0] != 9 || device->descriptor[1] != 2 ||
+				total < 9 || total > sizeof(device->descriptor) || !device->descriptor[5])
+				device->failed = true;
+			else device->descriptorLength = total;
+		} else if (purpose == kControlGetConfigurationDescriptor) {
+			if (length != device->descriptorLength || device->descriptor[0] != 9 ||
+				device->descriptor[1] != 2 ||
+				TritonProtocol::ReadLE16(device->descriptor + 2) != length)
+				device->failed = true;
+			else {
+				device->descriptorFetched = true;
+				if (slot->kind == ControllerUsbPolicy::kWiredTriton) {
+					device->hidLength = UsbDescriptors::HidReportLength(device->descriptor,
+						length, slot->interfaceNumber);
+					// Wired Triton has one combined HID interface. Refuse other
+					// topologies until physical-parent grouping is available.
+					if (device->descriptor[4] != 1 || !device->hidLength ||
+						device->hidLength > sizeof(device->hidDescriptor)) device->failed = true;
+				}
+			}
+		} else if (purpose == kControlGetHidDescriptor) {
+			device->hidValidated = length == device->hidLength &&
+				TritonHidDescriptor::Validate(device->hidDescriptor, length);
+			if (!device->hidValidated) device->failed = true;
+		} else if (purpose == kControlGetCurrentConfiguration) {
+			if (length != 1) device->failed = true;
+			else {
+				device->currentConfigurationKnown = true;
+				device->configured = device->currentConfiguration == device->descriptor[5];
+				if (device->currentConfiguration && !device->configured) device->failed = true;
+			}
+		} else device->configured = true;
+		if (device->failed)
+			DbgPrint("TritonDriver: unsupported USB descriptors/configuration, source %d interface %d\n",
+				slot->token.index, slot->interfaceNumber);
 		slot->controlBusy = false;
-		StartNextConfiguration();
-		return status;
-	}
-	if (purpose == kControlSetConfiguration) {
-		g_configurationBusy = false;
-		if (status == 0) {
-			g_configured = true;
-			if (!StartListening(slot))
-				DbgPrint("TritonDriver: Proteus slot %d endpoint initialization failed\n", slot->interfaceNumber);
-		} else {
-			DbgPrint("TritonDriver: Proteus slot %d configuration failed: %x\n", slot->interfaceNumber, status);
-			slot->configurationPending = true;
-		}
-		slot->controlBusy = false;
-		StartNextConfiguration();
 		return status;
 	}
 	if (purpose != kControlLizardOff) {
@@ -472,20 +463,20 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 	if (status == 0) {
 		if (!slot->loggedLizardSuccess) {
 			slot->loggedLizardSuccess = true;
-			DbgPrint("TritonDriver: Proteus slot %d lizard-off request completed successfully\n",
-				slot->interfaceNumber);
+			DbgPrint("TritonDriver: USB source %u lizard-off request completed successfully\n",
+				slot->token.index);
 		}
 		slot->retryDelay = kHeartbeatRetryMs;
 		slot->featureFailureCount = 0;
 		slot->heartbeatEnabled = true;
 		slot->heartbeatDeadline = GetTickCount() + kHeartbeatIntervalMs;
 	} else {
-		++slot->featureFailureCount;
+		if (slot->featureFailureCount < 255) ++slot->featureFailureCount;
 		if (slot->featureFailureCount <= 3 || slot->connected)
-			DbgPrint("TritonDriver: Proteus slot %d lizard-off request failed: %x\n", slot->interfaceNumber, status);
-		if (!slot->connected && slot->featureFailureCount >= 3) {
+			DbgPrint("TritonDriver: USB source %u lizard-off request failed: %x\n", slot->token.index, status);
+		if (ControllerUsbPolicy::ShouldPauseHeartbeat(slot->kind, slot->connected, slot->featureFailureCount)) {
 			slot->heartbeatEnabled = false;
-			DbgPrint("TritonDriver: Proteus slot %d empty; pausing lizard probes until wireless activity\n",
+			DbgPrint("TritonDriver: USB source %u empty; pausing lizard probes until wireless activity\n",
 				slot->interfaceNumber);
 			slot->controlBusy = false;
 			StartNextConfiguration();
@@ -505,15 +496,15 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 static void DispatchOutputs(uint32_t now) {
 	// All callers are serialized with USB DPCs. Guard synchronous completion
 	// reentry; asynchronous completions can drain other slots without a tick wait.
-	if (g_dispatchingOutputs || g_configurationBusy) return;
+	if (g_dispatchingOutputs) return;
 	g_dispatchingOutputs = true;
 	// Keep firmware raw mode alive even when games change strengths constantly.
 	for (int offset = 0; offset < kSlotCount; ++offset) {
 		int i = (g_nextHeartbeatSlot + offset) % kSlotCount;
-		ProteusSlot* slot = &g_slots[i];
+		UsbSource* slot = &g_slots[i];
 		if (!slot->handle || slot->removing || !slot->listening ||
-			!slot->heartbeatEnabled || slot->controlBusy) continue;
-		if ((int32_t)(now - slot->heartbeatDeadline) >= 0 && QueueLizardOff(slot)) {
+			!slot->heartbeatEnabled || slot->controlBusy || slot->device->configurationBusy) continue;
+		if ((!slot->heartbeatDeadline || (int32_t)(now - slot->heartbeatDeadline) >= 0) && QueueLizardOff(slot)) {
 			g_nextHeartbeatSlot = (i + 1) % kSlotCount;
 			break;
 		}
@@ -521,9 +512,9 @@ static void DispatchOutputs(uint32_t now) {
 	int firstRumbleSlot = g_nextRumbleSlot;
 	for (int offset = 0; offset < kSlotCount; ++offset) {
 		int i = (firstRumbleSlot + offset) % kSlotCount;
-		ProteusSlot* slot = &g_slots[i];
+		UsbSource* slot = &g_slots[i];
 		if (!slot->handle || slot->removing || !slot->listening || !slot->connected) continue;
-		slot->rumble.Update(ProteusReadRumbleRequest(slot->interfaceNumber));
+		slot->rumble.Update(ControllerReadRumbleRequest(slot->token));
 		if (QueueRumble(slot, now)) {
 			g_nextRumbleSlot = (i + 1) % kSlotCount;
 		}
@@ -531,7 +522,7 @@ static void DispatchOutputs(uint32_t now) {
 	g_dispatchingOutputs = false;
 }
 
-static int32_t QueueInput(ProteusSlot* slot) {
+static int32_t QueueInput(UsbSource* slot) {
 	if (!slot || slot->removing || !slot->listening) return 0;
 	// The interrupt callback and maintenance thread may both try to recover the
 	// input pipe. Claim the single reusable TRB before touching or queueing it.
@@ -539,23 +530,25 @@ static int32_t QueueInput(ProteusSlot* slot) {
 	slot->inputRetryDeadline = 0;
 	memset(slot->inputBuffer, 0, slot->inputLength);
 	UsbTrb* trb = &slot->extension->interruptTrb;
+	trb->length = slot->inputLength;
+	slot->extension->inputTransferredBytes = 0;
 	// As with control transfers, the return value is an opaque queue token.
 	// Keep ownership until InputComplete releases it.
 	int queueToken = UsbdQueueAsyncTransfer(slot->handle, trb);
 	if (!slot->loggedInputQueueResult) {
 		slot->loggedInputQueueResult = true;
-		DbgPrint("TritonDriver: Proteus slot %d input transfer queued token %x endpoint %02x\n",
-			slot->interfaceNumber, queueToken, slot->endpointDescriptor.bEndpointAddress);
+		DbgPrint("TritonDriver: USB source %u input transfer queued token %x endpoint %02x\n",
+			slot->token.index, queueToken, slot->endpointDescriptor.bEndpointAddress);
 	}
 	return queueToken;
 }
 
 static int32_t InputComplete(DWORD trbAddress, int32_t status) {
-	ProteusSlot* slot = FindSlotByInterruptTrb((void*)trbAddress);
+	UsbSource* slot = FindSlotByInterruptTrb((void*)trbAddress);
 	if (!slot) return status;
 	if (InterlockedCompareExchange(&slot->inputPending, 0, 1) != 1) {
-		DbgPrint("TritonDriver: Proteus slot %d unexpected input completion with no transfer pending\n",
-			slot->interfaceNumber);
+		DbgPrint("TritonDriver: USB source %u unexpected input completion with no transfer pending\n",
+			slot->token.index);
 		return status;
 	}
 	if (slot->removing) {
@@ -564,20 +557,22 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 	}
 	if (!slot->loggedInputCompletion) {
 		slot->loggedInputCompletion = true;
-		DbgPrint("TritonDriver: Proteus slot %d first input completion status %x\n",
-			slot->interfaceNumber, status);
+		DbgPrint("TritonDriver: USB source %u first input completion status %x\n",
+			slot->token.index, status);
 	}
 	if (status != 0) {
 		++slot->inputErrorCount;
 		if (slot->inputErrorCount <= 3 ||
 			(slot->inputErrorCount & (slot->inputErrorCount - 1)) == 0)
-			DbgPrint("TritonDriver: Proteus slot %d input error %x count %d; retrying with backoff\n",
+			DbgPrint("TritonDriver: USB source %u input error %x count %d; retrying with backoff\n",
 				slot->interfaceNumber, status, slot->inputErrorCount);
-		if (slot->connected) ProteusDisconnectController(slot->interfaceNumber);
+		if (slot->connected) ControllerDisconnect(slot->token);
 		slot->connected = false;
 		slot->inputRetryDeadline = GetTickCount() + kInputRetryMs;
 		return status;
 	}
+	size_t received = ControllerUsbPolicy::InputLength(slot->extension->inputTransferredBytes, slot->inputLength);
+	if (!received) return QueueInput(slot);
 	// A successful interrupt report means this interface is active even if the
 	// report ID is newer than the decoder. Prioritize its lizard-off request.
 	if (!slot->heartbeatEnabled) {
@@ -589,14 +584,14 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 	TritonProtocol::WirelessStatus wireless;
 	if (!slot->loggedFirstReport) {
 		slot->loggedFirstReport = true;
-		DbgPrint("TritonDriver: Proteus slot %d first interrupt report id %02x\n",
-			slot->interfaceNumber, slot->inputBuffer[0]);
+		DbgPrint("TritonDriver: USB source %u first interrupt report id %02x\n",
+			slot->token.index, slot->inputBuffer[0]);
 	}
-	if (TritonProtocol::DecodeInputPrefix(slot->inputBuffer, slot->inputLength, &input)) {
+	if (TritonProtocol::DecodeInputPrefix(slot->inputBuffer, received, &input)) {
 		if (!slot->loggedFirstState) {
 			slot->loggedFirstState = true;
-			DbgPrint("TritonDriver: Proteus slot %d accepted state report %02x\n",
-				slot->interfaceNumber, input.reportId);
+			DbgPrint("TritonDriver: USB source %u accepted state report %02x\n",
+				slot->token.index, input.reportId);
 		}
 		TritonProtocol::ControllerState report;
 		TritonProtocol::ConvertToControllerState(input, &report);
@@ -605,12 +600,12 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 		slot->heartbeatEnabled = true;
 		if (!wasConnected)
 			slot->heartbeatDeadline = 0;
-		ProteusPublishState(slot->interfaceNumber, report);
-	} else if (TritonProtocol::DecodeWirelessStatus(slot->inputBuffer, slot->inputLength, &wireless)) {
+		ControllerPublishState(slot->token, report);
+	} else if (slot->kind == ControllerUsbPolicy::kProteus && TritonProtocol::DecodeWirelessStatus(slot->inputBuffer, received, &wireless)) {
 		if (wireless == TritonProtocol::kWirelessDisconnected) {
 			slot->connected = false;
 			slot->heartbeatEnabled = false;
-			ProteusDisconnectController(slot->interfaceNumber);
+			ControllerDisconnect(slot->token);
 		} else {
 			bool wasConnected = slot->connected;
 			slot->connected = true;
@@ -625,68 +620,85 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 
 } // namespace
 
-bool ProteusIsSlot(uint16_t vendorId, uint16_t productId,
-	const usb_interface_descriptor* descriptor) {
-	return descriptor && TritonProtocol::IsProteusSlotInterface(vendorId, productId,
-		descriptor->bInterfaceNumber, descriptor->bInterfaceClass,
-		descriptor->bInterfaceSubClass, descriptor->bInterfaceProtocol);
-}
-
-int ProteusAddSlotInterface(deviceHandle* handle,
-	const usb_interface_descriptor* descriptor) {
-	ProteusSlot* slot = FindSlotByInterface(descriptor->bInterfaceNumber);
-	if (!slot || slot->handle) return 0;
+int ControllerUsbAdd(deviceHandle* handle, const usb_interface_descriptor* descriptor,
+	ControllerUsbPolicy::Kind kind) {
+	if (!handle || !descriptor || kind == ControllerUsbPolicy::kUnsupported) return -1;
+	UsbSource* duplicate = FindSlotByHandle(handle);
+	if (duplicate) return duplicate->removing ? -1 : 0;
+	int index = -1;
+	if (kind == ControllerUsbPolicy::kProteus) {
+		index = descriptor->bInterfaceNumber - TritonProtocol::kFirstSlotInterface;
+		if (index < 0 || index >= ControllerRouting::kPuckSlotCount || g_slots[index].handle) return -1;
+		// Do not join a puck that is still draining its previous attachment.
+		for (int i = 0; i < ControllerRouting::kPuckSlotCount; ++i) if (g_slots[i].removing) return -1;
+	} else {
+		for (int i = ControllerRouting::kPuckSlotCount; i < kSlotCount; ++i)
+			if (!g_slots[i].handle) { index = i; break; }
+		if (index < 0) return -1;
+	}
+	UsbSource* slot = &g_slots[index];
 	memset(slot, 0, sizeof(*slot));
+	if (!ControllerAttachSource(index, &slot->token)) return -1;
 	slot->handle = handle;
+	slot->kind = kind;
 	slot->interfaceNumber = descriptor->bInterfaceNumber;
 	slot->retryDelay = kHeartbeatRetryMs;
-	slot->extension = new ProteusControllerExtension();
-	if (!slot->extension) { memset(slot, 0, sizeof(*slot)); return -1; }
+	slot->device = kind == ControllerUsbPolicy::kProteus ? g_puckDevice : 0;
+	if (!slot->device) {
+		slot->device = new UsbDeviceContext();
+		if (slot->device) {
+			memset(slot->device, 0, sizeof(*slot->device));
+			slot->device->controlOwner = -1;
+			if (kind == ControllerUsbPolicy::kProteus) g_puckDevice = slot->device;
+		}
+	}
+	slot->extension = new UsbControllerExtension();
+	slot->reports = new ControlReports();
+	if (!slot->device || !slot->extension || !slot->reports) {
+		// No transfers exist yet, but routing retirement still needs its ack.
+		slot->removing = true;
+		slot->removeCompleteCalled = true;
+		ControllerRetireSource(slot->token);
+		UpdateRemovalReady(slot);
+		return -1;
+	}
 	memset(slot->extension, 0, sizeof(*slot->extension));
 	slot->extension->deviceHandle = handle;
-	slot->extension->interfaceNumber = descriptor->bInterfaceNumber;
 	slot->extension->deviceType = 1;
 	handle->driver = slot->extension;
 	UsbdAddDeviceComplete(handle, 0);
 	NTSTATUS result = UsbdOpenDefaultEndpoint(handle, (DWORD*)&slot->extension->controlTrb);
 	if (NT_ERROR(result)) {
-		delete slot->extension;
-		handle->driver = 0;
-		memset(slot, 0, sizeof(*slot));
+		ControllerUsbRemove(handle);
 		return result;
 	}
-	UsbTrb* controlTrb = &slot->extension->controlTrb.trb;
-	controlTrb->flags = 1;
-	controlTrb->callback = (DWORD)ControlComplete;
-	// As with the interrupt TRB, keep the endpoint saved by the open call stable
-	// for every later configuration and feature transfer.
-	controlTrb->savedEndpoint = controlTrb->endpoint;
-	DbgPrint("TritonDriver: Proteus slot interface %d initializing\n", slot->interfaceNumber);
+	UsbTrb* control = &slot->extension->controlTrb.trb;
+	control->flags = 1;
+	control->callback = (DWORD)ControlComplete;
+	control->savedEndpoint = control->endpoint;
 	slot->configurationPending = true;
+	DbgPrint("TritonDriver: %s source %d interface %d initializing\n",
+		kind == ControllerUsbPolicy::kProteus ? "Proteus" : "wired Triton", index, slot->interfaceNumber);
 	StartNextConfiguration();
 	return 0;
 }
 
-bool ProteusRemoveSlotInterface(deviceHandle* handle) {
-	ProteusSlot* slot = FindSlotByHandle(handle);
+bool ControllerUsbRemove(deviceHandle* handle) {
+	UsbSource* slot = FindSlotByHandle(handle);
 	if (!slot) return false;
 	if (slot->removing) return true;
 	slot->removing = true;
-	DbgPrint("TritonDriver: Proteus interface %d removal begin input %d control %d\n",
+	DbgPrint("TritonDriver: USB interface %d removal begin input %d control %d\n",
 		slot->interfaceNumber, slot->inputPending, slot->controlBusy);
-	ProteusDisconnectController(slot->interfaceNumber);
-	if (slot->controlPurpose == kControlGetConfigurationDescriptor ||
-		slot->controlPurpose == kControlSetConfiguration)
-		g_configurationBusy = false;
-	int slotIndex = (int)(slot - g_slots);
-	InterlockedCompareExchange(&g_controlOwnerSlot, -1, slotIndex);
+	ControllerRetireSource(slot->token);
+	// Completion owns the arbiter until its callback, even during removal.
 	// Explicit endpoint closes can block during physical composite-device
 	// removal. Let the USB core cancel the pipes as part of remove completion;
 	// all TRB storage remains quarantined, so late callbacks stay memory-safe.
-	DbgPrint("TritonDriver: Proteus interface %d calling kernel removal complete\n",
+	DbgPrint("TritonDriver: USB interface %d calling kernel removal complete\n",
 		slot->interfaceNumber);
 	UsbdRemoveDeviceComplete(handle);
-	DbgPrint("TritonDriver: Proteus interface %d kernel removal returned\n",
+	DbgPrint("TritonDriver: USB interface %d kernel removal returned\n",
 		slot->interfaceNumber);
 	slot->removeCompleteCalled = true;
 	UpdateRemovalReady(slot);
@@ -697,13 +709,13 @@ bool ProteusRemoveSlotInterface(deviceHandle* handle) {
 	return true;
 }
 
-void ProteusMaintenance(uint32_t nowMilliseconds) {
+void ControllerUsbMaintenance(uint32_t nowMilliseconds) {
 	for (int i = 0; i < kSlotCount; ++i) {
-		ProteusSlot* slot = &g_slots[i];
+		UsbSource* slot = &g_slots[i];
 		if (slot->removing) {
 			if (!slot->loggedRemovalWait) {
 			slot->loggedRemovalWait = true;
-			DbgPrint("TritonDriver: Proteus interface %d waiting for removal transfers input %d control %d\n",
+			DbgPrint("TritonDriver: USB interface %d waiting for removal transfers input %d control %d\n",
 				slot->interfaceNumber, slot->inputPending, slot->controlBusy);
 			}
 			UpdateRemovalReady(slot);
@@ -721,9 +733,10 @@ void ProteusMaintenance(uint32_t nowMilliseconds) {
 			slot->loggedRumbleWait = true;
 			DbgPrint("TritonDriver: rumble USB pending over 250 ms interface %d via %s endpoint %02x control owner %d\n",
 				slot->interfaceNumber, slot->output ? "interrupt-OUT" : "control",
-				slot->outputEndpoint, g_controlOwnerSlot);
+				slot->outputEndpoint, slot->device->controlOwner);
 			// A timeout is diagnostic only. USB may still own the buffer/TRB.
 		}
 	}
+	StartNextConfiguration();
 	DispatchOutputs(nowMilliseconds);
 }

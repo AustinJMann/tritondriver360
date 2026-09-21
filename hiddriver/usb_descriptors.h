@@ -7,6 +7,29 @@
 
 namespace UsbDescriptors {
 
+inline uint16_t HidReportLength(const uint8_t* bytes, size_t length, uint8_t interfaceNumber) {
+	if (!bytes || length < 9 || bytes[0] != 9 || bytes[1] != 2) return 0;
+	size_t total = (size_t)bytes[2] | ((size_t)bytes[3] << 8);
+	if (total != length) return 0;
+	bool matching = false;
+	uint16_t reportLength = 0;
+	for (size_t offset = 9; offset < total;) {
+		if (total - offset < 2) return 0;
+		const uint8_t* d = bytes + offset;
+		if (d[0] < 2 || d[0] > total - offset) return 0;
+		if (d[1] == 4) {
+			if (d[0] < 9) return 0;
+			matching = d[2] == interfaceNumber && d[3] == 0 && d[5] == 3 && d[6] == 0 && d[7] == 0;
+		} else if (d[1] == 0x21 && matching) {
+			if (d[0] < 6 || d[0] != 6 + 3 * d[5]) return 0;
+			for (unsigned j = 6; j < d[0]; j += 3)
+				if (d[j] == 0x22) reportLength = (uint16_t)(d[j + 1] | (d[j + 2] << 8));
+		}
+		offset += d[0];
+	}
+	return reportLength;
+}
+
 static const size_t kEndpointDescriptorSize = 7;
 
 inline bool IsInterruptEndpoint(const usb_endpoint_descriptor& endpoint, bool input) {

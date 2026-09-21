@@ -28,16 +28,17 @@ struct UsbPacket {
 
 struct UsbControlTrb {
 	UsbTrb trb;
-	uint8_t pad[4];
+	uint32_t transferredBytes;
 	UsbPacket packet;
 };
 
 struct deviceHandle;
-struct __declspec(align(2)) ProteusControllerExtension {
+struct __declspec(align(4)) UsbControllerExtension {
 	deviceHandle* deviceHandle;
 	UsbTrb interruptTrb;
-	uint8_t interfaceNumber;
-	uint8_t gap20[3];
+	// The common transfer completion writes its byte count at TRB + 0x1c.
+	// Interface identity belongs in the transport record, outside this prefix.
+	uint32_t inputTransferredBytes;
 	UsbControlTrb controlTrb;
 	uint8_t gap4C[4];
 	uint32_t cleanupHandler;
@@ -53,22 +54,21 @@ struct __declspec(align(2)) ProteusControllerExtension {
 	uint8_t deviceType;
 	uint8_t alwaysZeroThree;
 	uint8_t alwaysZeroFour;
-
 };
 
 struct deviceHandle {
-	ProteusControllerExtension* driver;
+	UsbControllerExtension* driver;
 };
 
-static_assert(offsetof(ProteusControllerExtension, interruptTrb) == 0x04,
+static_assert(offsetof(UsbControllerExtension, interruptTrb) == 0x04,
 	"USB extension interrupt TRB offset changed");
-static_assert(offsetof(ProteusControllerExtension, interfaceNumber) == 0x20,
-	"USB extension interface offset changed");
-static_assert(offsetof(ProteusControllerExtension, controlTrb) == 0x24,
+static_assert(offsetof(UsbControllerExtension, inputTransferredBytes) == 0x20,
+	"USB extension input completion offset changed");
+static_assert(offsetof(UsbControllerExtension, controlTrb) == 0x24,
 	"USB extension control TRB offset changed");
-static_assert(offsetof(ProteusControllerExtension, cleanupHandler) == 0x50,
+static_assert(offsetof(UsbControllerExtension, cleanupHandler) == 0x50,
 	"USB extension cleanup handler offset changed");
-static_assert(offsetof(ProteusControllerExtension, queue) == 0x6c,
+static_assert(offsetof(UsbControllerExtension, queue) == 0x6c,
 	"USB extension queue offset changed");
-static_assert(sizeof(ProteusControllerExtension) == 0x7c,
+static_assert(sizeof(UsbControllerExtension) == 0x7c,
 	"USB extension kernel-observed prefix size changed");
