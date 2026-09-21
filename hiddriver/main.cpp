@@ -4,11 +4,13 @@
 
 #include "Detours.h"
 #include "controller_capabilities.h"
+#include "config_storage.h"
 #include "driver_types.h"
 #include "proteus.h"
 #include "proteus_routing.h"
 #include "rumble_output.h"
 #include "triton_protocol.h"
+#include "triton_config.h"
 #include "usb.h"
 
 static const int kControllerCount = 4;
@@ -96,6 +98,11 @@ ProteusRoutingSlot g_proteusSlots[ProteusRouting::kSlotCount];
 // Atomically publish strengths together with the owning binding generation.
 __declspec(align(8)) volatile LONG64 g_rumbleRequests[ProteusRouting::kSlotCount];
 static volatile LONG g_abortServiceStartup;
+static TritonConfig::Config g_config;
+static const TritonConfig::Profile* volatile g_activeProfile;
+static volatile LONG g_profileEpoch;
+static DWORD g_activeTitleId;
+static bool g_hasActiveTitle;
 
 uint16_t Swap16(uint16_t value) { return (uint16_t)((value >> 8) | (value << 8)); }
 
@@ -120,10 +127,47 @@ void InitializeRouting() {
 	memset(g_controllers, 0, sizeof(g_controllers));
 	memset(g_proteusSlots, 0, sizeof(g_proteusSlots));
 	memset((void*)g_rumbleRequests, 0, sizeof(g_rumbleRequests));
+	TritonConfig::Initialize(&g_config);
+	g_activeProfile = &g_config.defaults;
+	g_profileEpoch = 0;
+	g_hasActiveTitle = false;
 	for (int i = 0; i < ProteusRouting::kSlotCount; ++i) {
 		g_proteusSlots[i].controllerIndex = ProteusRouting::kUnboundController;
 		g_proteusSlots[i].generation = 1;
 	}
+}
+
+const TritonConfig::Profile* ReadActiveProfile() {
+	const TritonConfig::Profile* profile =
+		(const TritonConfig::Profile*)InterlockedCompareExchange(
+			(volatile LONG*)&g_activeProfile, 0, 0);
+	return profile ? profile : &g_config.defaults;
+}
+
+void StopRumbleForTitleChange() {
+	for (int i = 0; i < ProteusRouting::kSlotCount; ++i) {
+		ProteusRoutingSlot& slot = g_proteusSlots[i];
+		uint32_t generation = (uint32_t)slot.generation;
+		if (slot.connected && !slot.disconnectPending && slot.controllerIndex >= 0 && generation)
+			InterlockedExchange64(&g_rumbleRequests[i],
+				(LONG64)RumbleOutput::Request(generation, 0, 0));
+		else
+			InterlockedExchange64(&g_rumbleRequests[i], 0);
+	}
+}
+
+void ActivateTitleProfile(DWORD titleId) {
+	if (g_hasActiveTitle && titleId == g_activeTitleId) return;
+	const TritonConfig::Profile* profile = TritonConfig::FindProfile(g_config, titleId);
+	// Odd epochs reject rumble publication while the active title changes.
+	InterlockedIncrement(&g_profileEpoch);
+	InterlockedExchange((volatile LONG*)&g_activeProfile, (LONG)profile);
+	StopRumbleForTitleChange();
+	InterlockedIncrement(&g_profileEpoch);
+	g_activeTitleId = titleId;
+	g_hasActiveTitle = true;
+	DbgPrint("TritonDriver: title %08X using %s controller profile\n", titleId,
+		profile == &g_config.defaults ? "default" : "per-game");
 }
 
 int ReserveController() {
@@ -289,11 +333,14 @@ int HidAddDeviceHook(deviceHandle* handle) {
 DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration);
 
 struct XboxRumbleBackend {
+	explicit XboxRumbleBackend(LONG profileEpoch) : profileEpoch(profileEpoch) {}
+
 	struct Target {
 		DWORD user;
 		int controllerIndex;
 		int slotIndex;
 		uint32_t generation;
+		LONG profileEpoch;
 	};
 
 	bool Find(uint32_t user, Target* target) {
@@ -303,6 +350,7 @@ struct XboxRumbleBackend {
 		target->controllerIndex = (int)(controller - g_controllers);
 		target->slotIndex = controller->slotIndex;
 		target->generation = controller->slotGeneration;
+		target->profileEpoch = profileEpoch;
 		return true;
 	}
 
@@ -314,6 +362,9 @@ struct XboxRumbleBackend {
 	uint32_t Submit(const Target& target, uint16_t left, uint16_t right) {
 		int slotIndex = target.slotIndex;
 		uint32_t generation = target.generation;
+		if ((target.profileEpoch & 1) ||
+			InterlockedCompareExchange(&g_profileEpoch, 0, 0) != target.profileEpoch)
+			return ERROR_BUSY;
 		if (!ProteusRouting::IsValidSlotIndex(slotIndex)) return ERROR_DEVICE_NOT_CONNECTED;
 		ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
 		int controllerIndex = target.controllerIndex;
@@ -328,16 +379,29 @@ struct XboxRumbleBackend {
 			LONG64 previous = InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], 0, 0);
 			if (!generation || RumbleOutput::Generation((uint64_t)previous) != generation)
 				return ERROR_DEVICE_NOT_CONNECTED;
-			if (InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], desired, previous) == previous)
-				return ERROR_SUCCESS;
+			if (InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], desired, previous) == previous) {
+				if (InterlockedCompareExchange(&g_profileEpoch, 0, 0) == target.profileEpoch)
+					return ERROR_SUCCESS;
+				LONG64 stopped = (LONG64)RumbleOutput::Request(generation, 0, 0);
+				InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], stopped, desired);
+				return ERROR_BUSY;
+			}
 		}
 		return ERROR_BUSY;
 	}
+
+private:
+	LONG profileEpoch;
 };
 
 DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration) {
-	XboxRumbleBackend backend;
-	return RumbleOutput::SetState(user, flags, vibration, backend);
+	LONG profileEpoch = InterlockedCompareExchange(&g_profileEpoch, 0, 0);
+	if (profileEpoch & 1) return ERROR_BUSY;
+	RumbleOutput::Settings settings = ReadActiveProfile()->rumble;
+	if (InterlockedCompareExchange(&g_profileEpoch, 0, 0) != profileEpoch)
+		return ERROR_BUSY;
+	XboxRumbleBackend backend(profileEpoch);
+	return RumbleOutput::SetState(user, flags, vibration, backend, settings);
 }
 
 bool IsLiveController(int index) {
@@ -436,6 +500,7 @@ NTSTATUS XInputdReadStateHook(DWORD context, PDWORD packetNumber,
 		if (!slot.connected || slot.controllerIndex != controllerIndex ||
 			(uint32_t)slot.generation != generation) memset(&state, 0, sizeof(state));
 	}
+	TritonConfig::ApplyPaddleBindings(*ReadActiveProfile(), &state);
 	memset(output, 0, sizeof(*output));
 	if (state.guide) {
 		DWORD now = GetTickCount();
@@ -541,9 +606,12 @@ void ProteusDisconnectController(uint8_t interfaceNumber) {
 }
 
 DWORD WINAPI ProteusBindingThreadProc(void*) {
+	g_hasActiveTitle = false;
 	for (;;) {
 		// Binding can block in XAM. Keep it off the rumble refresh worker.
 		ProcessProteusEvents();
+		DWORD titleId = XamIsCurrentTitleDash() ? 0 : XamGetCurrentTitleId();
+		ActivateTitleProfile(titleId);
 		Sleep(100);
 	}
 }
@@ -567,6 +635,10 @@ BOOL APIENTRY DllMain(HANDLE, DWORD reason, PVOID) {
 	DbgPrint("TritonDriver: starting Triton-over-Proteus driver\n");
 	if (!InitializeFunctionPointers()) return FALSE;
 	InitializeRouting();
+	// The stock USB stack still owns the mass-storage volumes here. Load and,
+	// when needed, create the config before the stack is powered down below.
+	// ConfigStorage uses kernel-native synchronous I/O and does not call XAM.
+	ConfigStorage::LoadOrCreate(&g_config);
 	// Fail before installing hooks if the worker cannot be created. Returning
 	// FALSE with live hooks would leave kernel calls targeting an unloaded DLL.
 	HANDLE serviceThread = MakeSystemThread(ProteusServiceThreadProc, 0);

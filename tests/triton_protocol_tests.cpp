@@ -8,6 +8,7 @@
 #include <Xinput.h>
 #include "../hiddriver/controller_capabilities.h"
 #include "../hiddriver/rumble_output.h"
+#include "../hiddriver/triton_config.h"
 
 #include "../hiddriver/triton_protocol.h"
 #include "../hiddriver/proteus_routing.h"
@@ -303,6 +304,85 @@ static void TestButtonsAndTriggers() {
 	ConvertToControllerState(state, &b);
 	assert(b.leftTrigger == 0);
 	assert(b.rightTrigger == 128);
+	Put32(packet + 2, 0x00000080 | 0x00000100 | 0x00020000 | 0x00040000);
+	Put16(packet + 6, 0); Put16(packet + 8, 0);
+	assert(DecodeInputPrefix(packet, sizeof(packet), &state));
+	ConvertToControllerState(state, &b);
+	assert(b.r4 && b.r5 && b.l4 && b.l5);
+}
+
+static void TestConfigDefaultsAndBlackOpsProfile() {
+	TritonConfig::Config config;
+	TritonConfig::ParseError error = {};
+	assert(TritonConfig::Parse(TritonConfig::DefaultFileText(),
+		TritonConfig::DefaultFileSize(), &config, &error));
+	assert(config.gameCount == 1);
+	const TritonConfig::Profile* defaults = TritonConfig::FindProfile(config, 0x12345678);
+	assert(defaults == &config.defaults);
+	assert(defaults->rumble.enabled);
+	assert(defaults->rumble.deadzone == RumbleOutput::kIntensityDeadzone);
+	assert(defaults->rumble.leftGainPermille == 2000);
+	assert(defaults->rumble.rightGainPermille == 2000);
+	assert(defaults->rumble.curve == RumbleOutput::kCurveCubic);
+	const TritonConfig::Profile* blackOps = TritonConfig::FindProfile(config, 0x415608C3);
+	assert(blackOps != defaults);
+	assert(blackOps->paddles[TritonConfig::kPaddleR4] == TritonConfig::kBindingX);
+	assert(blackOps->paddles[TritonConfig::kPaddleR5] == TritonConfig::kBindingY);
+	assert(blackOps->paddles[TritonConfig::kPaddleL4] == TritonConfig::kBindingA);
+	assert(blackOps->paddles[TritonConfig::kPaddleL5] == TritonConfig::kBindingB);
+	assert(blackOps->rumble.deadzone == defaults->rumble.deadzone);
+
+	ControllerState state = {};
+	state.r4 = state.r5 = state.l4 = state.l5 = 1;
+	TritonConfig::ApplyPaddleBindings(*blackOps, &state);
+	assert(state.x && state.y && state.a && state.b);
+}
+
+static void TestConfigOverridesAndValidation() {
+	const char configText[] =
+		"version: 1\n"
+		"defaults:\n"
+		"  paddles:\n"
+		"    l4: left_trigger\n"
+		"  rumble:\n"
+		"    enabled: true\n"
+		"    left_gain: 1.25\n"
+		"    right_gain: 0.5\n"
+		"    deadzone: 0.2\n"
+		"    curve: quadratic\n"
+		"games:\n"
+		"  'DEADBEEF':\n"
+		"    paddles:\n"
+		"      r4: dpad_up\n"
+		"    rumble:\n"
+		"      enabled: false\n"
+		"      curve: linear\n";
+	TritonConfig::Config config;
+	TritonConfig::ParseError error = {};
+	assert(TritonConfig::Parse(configText, sizeof(configText) - 1, &config, &error));
+	const TritonConfig::Profile* profile = TritonConfig::FindProfile(config, 0xdeadbeef);
+	assert(profile->paddles[TritonConfig::kPaddleL4] == TritonConfig::kBindingLeftTrigger);
+	assert(profile->paddles[TritonConfig::kPaddleR4] == TritonConfig::kBindingDpadUp);
+	assert(!profile->rumble.enabled);
+	assert(profile->rumble.leftGainPermille == 1250);
+	assert(profile->rumble.rightGainPermille == 500);
+	assert(profile->rumble.curve == RumbleOutput::kCurveLinear);
+	ControllerState state = {};
+	state.leftTrigger = 100;
+	state.l4 = state.r4 = 1;
+	TritonConfig::ApplyPaddleBindings(*profile, &state);
+	assert(state.leftTrigger == 255 && state.dpadUp);
+
+	const char duplicate[] = "version: 1\ndefaults:\n  paddles:\n    l4: a\n    l4: b\n";
+	assert(!TritonConfig::Parse(duplicate, sizeof(duplicate) - 1, &config, &error));
+	assert(error.line == 5);
+	const char invalidTitle[] = "version: 1\ngames:\n  BAD:\n    paddles:\n      l4: a\n";
+	assert(!TritonConfig::Parse(invalidTitle, sizeof(invalidTitle) - 1, &config, &error));
+	const char invalidRange[] = "version: 1\ndefaults:\n  rumble:\n    deadzone: 0.951\n";
+	assert(!TritonConfig::Parse(invalidRange, sizeof(invalidRange) - 1, &config, &error));
+	const char overflowingVersion[] = "version: 4294967297\n";
+	assert(!TritonConfig::Parse(overflowingVersion,
+		sizeof(overflowingVersion) - 1, &config, &error));
 }
 
 static void TestStatusAndFeature() {
@@ -585,17 +665,44 @@ static void TestRumbleXamDispatch() {
 }
 
 static void TestRumbleDeadzoneAndCubicScaling() {
-	using RumbleOutput::ScaleIntensity;
-	assert(ScaleIntensity(0) == 0);
-	assert(ScaleIntensity(RumbleOutput::kIntensityDeadzone - 1) == 0);
-	assert(ScaleIntensity(RumbleOutput::kIntensityDeadzone) == 0);
-	assert(ScaleIntensity(RumbleOutput::kIntensityDeadzone + 1) <= 1);
+	RumbleOutput::Settings settings = RumbleOutput::DefaultSettings();
+	settings.leftGainPermille = 1000;
+	assert(RumbleOutput::ScaleIntensity(0, settings.deadzone, settings.curve, 1000) == 0);
+	assert(RumbleOutput::ScaleIntensity(RumbleOutput::kIntensityDeadzone - 1,
+		settings.deadzone, settings.curve, 1000) == 0);
+	assert(RumbleOutput::ScaleIntensity(RumbleOutput::kIntensityDeadzone,
+		settings.deadzone, settings.curve, 1000) == 0);
+	assert(RumbleOutput::ScaleIntensity(RumbleOutput::kIntensityDeadzone + 1,
+		settings.deadzone, settings.curve, 1000) <= 1);
 	uint16_t activeMidpoint = (uint16_t)(RumbleOutput::kIntensityDeadzone +
 		(0xffffu - RumbleOutput::kIntensityDeadzone) / 2);
-	assert(ScaleIntensity(activeMidpoint) >= 8191 && ScaleIntensity(activeMidpoint) <= 8193);
-	assert(ScaleIntensity(0xffff) == 0xffff);
+	uint16_t midpoint = RumbleOutput::ScaleIntensity(activeMidpoint,
+		settings.deadzone, settings.curve, 1000);
+	assert(midpoint >= 8191 && midpoint <= 8193);
+	assert(RumbleOutput::ScaleIntensity(0xffff, settings.deadzone, settings.curve, 1000) == 0xffff);
 	for (uint32_t value = 1; value <= 0xffff; ++value)
-		assert(ScaleIntensity((uint16_t)value) >= ScaleIntensity((uint16_t)(value - 1)));
+		assert(RumbleOutput::ScaleIntensity((uint16_t)value, settings.deadzone, settings.curve, 1000) >=
+			RumbleOutput::ScaleIntensity((uint16_t)(value - 1), settings.deadzone, settings.curve, 1000));
+}
+
+static void TestTunableRumbleScaling() {
+	RumbleOutput::Settings settings = RumbleOutput::DefaultSettings();
+	settings.deadzone = 0;
+	settings.curve = RumbleOutput::kCurveLinear;
+	settings.leftGainPermille = 500;
+	settings.rightGainPermille = 2000;
+	assert(RumbleOutput::ScaleIntensity(32768, settings.deadzone, settings.curve,
+		settings.leftGainPermille) == 16384);
+	assert(RumbleOutput::ScaleIntensity(32768, settings.deadzone, settings.curve,
+		settings.rightGainPermille) == 65535);
+	TestRumbleBackend backend = {};
+	backend.ownsUser = true;
+	TestVibration vibration = { 32768, 32768 };
+	assert(RumbleOutput::SetState(0, 0, &vibration, backend, settings) == 0);
+	assert(backend.left == 16384 && backend.right == 65535);
+	settings.enabled = false;
+	assert(RumbleOutput::SetState(0, 0, &vibration, backend, settings) == 0);
+	assert(backend.left == 0 && backend.right == 0);
 }
 
 static void TestRumbleEncoding() {
@@ -709,6 +816,9 @@ int main() {
 	TestUsbOutputDescriptors();
 	TestRumbleXamDispatch();
 	TestRumbleDeadzoneAndCubicScaling();
+	TestTunableRumbleScaling();
+	TestConfigDefaultsAndBlackOpsProfile();
+	TestConfigOverridesAndValidation();
 	TestControllerCapabilities();
 	TestRumbleEncoding();
 	TestRumbleRefreshAndCoalescing();

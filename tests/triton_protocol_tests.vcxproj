@@ -28,6 +28,7 @@
   <ItemGroup>
     <ClCompile Include="triton_protocol_tests.cpp" />
     <ClCompile Include="..\hiddriver\triton_protocol.cpp" />
+    <ClCompile Include="..\hiddriver\triton_config.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

@@ -56,6 +56,10 @@ struct ControllerState {
 	uint8_t rightShoulder;
 	uint8_t leftShoulder;
 	uint8_t guide;
+	uint8_t r4;
+	uint8_t r5;
+	uint8_t l4;
+	uint8_t l5;
 };
 #pragma pack(pop)
 

@@ -92,19 +92,23 @@
   <ItemGroup>
     <ClInclude Include="Detours.h" />
     <ClInclude Include="controller_capabilities.h" />
+    <ClInclude Include="config_storage.h" />
     <ClInclude Include="driver_types.h" />
     <ClInclude Include="proteus.h" />
     <ClInclude Include="proteus_routing.h" />
     <ClInclude Include="rumble_output.h" />
     <ClInclude Include="triton_protocol.h" />
+    <ClInclude Include="triton_config.h" />
     <ClInclude Include="usb.h" />
     <ClInclude Include="usb_descriptors.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="config_storage.cpp" />
     <ClCompile Include="Detours.cpp" />
     <ClCompile Include="proteus.cpp" />
     <ClCompile Include="triton_protocol.cpp" />
+    <ClCompile Include="triton_config.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />

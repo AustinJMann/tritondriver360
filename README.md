@@ -30,9 +30,61 @@ Supported input includes face buttons, D-pad, shoulders, stick clicks, menu and
 view, both sticks, analog triggers, and the guide button.
 
 Rumble is implemented and works, but it might feel weird in some games.
-This is a know issue when converting rumble designed for use with a motor to the
-Trition controller. I have implemented a curve and cutoff that makes it feel better,
+This is a known issue when converting rumble designed for use with a motor to the
+Triton controller. I have implemented a curve and cutoff that makes it feel better,
 but some games still feel a bit off or cause a rumble pulsing feeling.
+
+## Configuration
+
+At startup, TritonDriver looks for `tritonconfig.yml` at the root of each
+native USB mass-storage volume, then falls back to `Hdd1:\tritonconfig.yml`.
+It performs file I/O through the native kernel paths, so loading does not depend
+on dashboard drive aliases being visible to the system plugin. If no config
+exists, it creates a default file on the first writable USB, or on `Hdd1:` when
+no USB is writable. Restart the console or reload the plugin after editing the
+file.
+
+The generated config uses a cubic rumble response with maximum `2.0` gain as
+its global default and includes a Call of Duty: Black Ops II profile:
+
+```yaml
+version: 1
+
+defaults:
+  paddles:
+    r4: none
+    r5: none
+    l4: none
+    l5: none
+  rumble:
+    enabled: true
+    left_gain: 2.0
+    right_gain: 2.0
+    deadzone: 0.10
+    curve: cubic
+
+games:
+  "415608C3": # Call of Duty: Black Ops II
+    paddles:
+      r4: x
+      r5: y
+      l4: a
+      l5: b
+```
+
+Game keys are eight-digit hexadecimal Xbox 360 Title IDs. An override inherits
+any omitted value from `defaults`, applies to every connected Triton while that
+title runs, and is removed when the title closes. Supported rumble curves are
+`linear`, `quadratic`, and `cubic`; gains range from `0.0` to `2.0`, and the
+deadzone ranges from `0.0` to `0.95`.
+
+Paddles may be bound to `none`, `a`, `b`, `x`, `y`, `dpad_up`, `dpad_down`,
+`dpad_left`, `dpad_right`, `left_shoulder`, `right_shoulder`, `left_stick`,
+`right_stick`, `start`, `back`, `guide`, `left_trigger`, or `right_trigger`.
+The parser accepts the mapping-based YAML shown above; YAML sequences, anchors,
+and multiline scalar values are not supported. If an existing config is invalid,
+the driver logs its line number, leaves the file unchanged, and uses built-in
+defaults for that session.
 
 ## Current limitations
 

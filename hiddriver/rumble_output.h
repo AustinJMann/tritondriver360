@@ -13,6 +13,25 @@ static const uint32_t kServiceMs = 5;
 // the response curve.
 static const uint16_t kIntensityDeadzone = 6554; // 10% of the XInput range.
 
+enum Curve {
+	kCurveLinear,
+	kCurveQuadratic,
+	kCurveCubic
+};
+
+struct Settings {
+	bool enabled;
+	uint16_t deadzone;
+	uint16_t leftGainPermille;
+	uint16_t rightGainPermille;
+	Curve curve;
+};
+
+inline Settings DefaultSettings() {
+	Settings settings = { true, kIntensityDeadzone, 2000, 2000, kCurveCubic };
+	return settings;
+}
+
 inline uint64_t Request(uint32_t generation, uint16_t left, uint16_t right) {
 	return ((uint64_t)generation << 32) | ((uint32_t)left << 16) | right;
 }
@@ -21,15 +40,28 @@ inline uint16_t Left(uint64_t request) { return (uint16_t)(request >> 16); }
 inline uint16_t Right(uint64_t request) { return (uint16_t)request; }
 inline bool Active(uint64_t request) { return (uint32_t)request != 0; }
 
-// Remove the low-end hardware floor, then apply a cubic response over the
-// remaining range. Renormalizing after the deadzone preserves full output.
-inline uint16_t ScaleIntensity(uint16_t value) {
-	if (value <= kIntensityDeadzone) return 0;
-	const uint32_t span = 65535u - kIntensityDeadzone;
-	const uint32_t adjusted = (uint32_t)value - kIntensityDeadzone;
+// Remove the low-end hardware floor, apply the selected response curve and
+// gain, then clamp. Renormalizing after the deadzone preserves full output.
+inline uint16_t ScaleIntensity(uint16_t value, uint16_t deadzone,
+	Curve curve, uint16_t gainPermille) {
+	if (value <= deadzone || gainPermille == 0) return 0;
+	const uint32_t span = 65535u - deadzone;
+	const uint32_t adjusted = (uint32_t)value - deadzone;
 	const uint32_t normalized = (adjusted * 65535u + span / 2) / span;
-	const uint32_t squared = (normalized * normalized + 32767u) / 65535u;
-	return (uint16_t)((squared * normalized + 32767u) / 65535u);
+	uint32_t curved = normalized;
+	if (curve != kCurveLinear) {
+		const uint32_t squared = (normalized * normalized + 32767u) / 65535u;
+		curved = curve == kCurveQuadratic ? squared :
+			(squared * normalized + 32767u) / 65535u;
+	}
+	uint32_t scaled = (curved * gainPermille + 500u) / 1000u;
+	return (uint16_t)(scaled > 65535u ? 65535u : scaled);
+}
+
+inline uint16_t ScaleIntensity(uint16_t value) {
+	Settings settings = DefaultSettings();
+	return ScaleIntensity(value, settings.deadzone, settings.curve,
+		settings.leftGainPermille);
 }
 
 // Route by ownership, never by the native driver's return code. XAM may accept
@@ -37,14 +69,25 @@ inline uint16_t ScaleIntensity(uint16_t value) {
 // Backend keeps platform-specific binding checks and atomic publication outside
 // this dispatch policy so host tests exercise the same decision as the hook.
 template <typename Vibration, typename Backend>
-uint32_t SetState(uint32_t user, uint32_t flags, Vibration* vibration, Backend& backend) {
+uint32_t SetState(uint32_t user, uint32_t flags, Vibration* vibration, Backend& backend,
+	const Settings& settings) {
 	uint32_t normalizedUser = (user & 0xff) == 0xff ? 0 : user;
 	typename Backend::Target target;
 	if (!backend.Find(normalizedUser, &target))
 		return backend.Native(user, flags, vibration);
 	if (!vibration) return 87; // ERROR_INVALID_PARAMETER
-	return backend.Submit(target, ScaleIntensity(vibration->wLeftMotorSpeed),
-		ScaleIntensity(vibration->wRightMotorSpeed));
+	if (!settings.enabled) return backend.Submit(target, 0, 0);
+	return backend.Submit(target,
+		ScaleIntensity(vibration->wLeftMotorSpeed, settings.deadzone,
+			settings.curve, settings.leftGainPermille),
+		ScaleIntensity(vibration->wRightMotorSpeed, settings.deadzone,
+			settings.curve, settings.rightGainPermille));
+}
+
+template <typename Vibration, typename Backend>
+uint32_t SetState(uint32_t user, uint32_t flags, Vibration* vibration, Backend& backend) {
+	Settings settings = DefaultSettings();
+	return SetState(user, flags, vibration, backend, settings);
 }
 
 // Zero-initializable; used only on the USB processor at dispatch IRQL.
