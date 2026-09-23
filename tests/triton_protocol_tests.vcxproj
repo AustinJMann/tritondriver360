@@ -29,6 +29,11 @@
     <ClCompile Include="triton_protocol_tests.cpp" />
     <ClCompile Include="..\hiddriver\triton_protocol.cpp" />
     <ClCompile Include="..\hiddriver\triton_config.cpp" />
+    <ClCompile Include="..\hiddriver\mouse_joystick.cpp" />
+    <ClCompile Include="..\hiddriver\trackball_motion.cpp" />
+    <ClCompile Include="..\hiddriver\trackpad_motion.cpp" />
+    <ClCompile Include="..\hiddriver\trackpad_haptics.cpp" />
+    <ClCompile Include="..\hiddriver\input_processing.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

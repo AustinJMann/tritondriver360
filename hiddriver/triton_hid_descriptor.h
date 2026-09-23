@@ -7,7 +7,9 @@ namespace TritonHidDescriptor {
 
 // Only the report sizes used by this driver are retained. Reject unsupported
 // long items and malformed nesting rather than accepting a partial descriptor.
-inline bool Validate(const uint8_t* bytes, size_t length) {
+// Haptic command report 0x82 is optional; its absence disables pad haptics.
+inline bool Validate(const uint8_t* bytes, size_t length, bool* hapticCommand = 0) {
+	if (hapticCommand) *hapticCommand = false;
 	if (!bytes || !length) return false;
 	struct Globals {
 		uint32_t size;
@@ -15,7 +17,7 @@ inline bool Validate(const uint8_t* bytes, size_t length) {
 		uint32_t id;
 	} current = {}, stack[8];
 	unsigned depth = 0, collections = 0;
-	uint32_t inputBits[3] = {}, featureBits = 0, outputBits = 0;
+	uint32_t inputBits[3] = {}, featureBits = 0, outputBits = 0, hapticBits = 0;
 	for (size_t offset = 0; offset < length;) {
 		uint8_t prefix = bytes[offset++];
 		if (prefix == 0xfe) return false;
@@ -54,6 +56,7 @@ inline bool Validate(const uint8_t* bytes, size_t length) {
 					if (current.id == 0x45) total = &inputBits[1];
 					if (current.id == 0x47) total = &inputBits[2];
 				} else if (tag == 9 && current.id == 0x80) total = &outputBits;
+				else if (tag == 9 && current.id == 0x82) total = &hapticBits;
 				else if (tag == 11 && current.id == 1) total = &featureBits;
 				if (total) {
 					*total += bits;
@@ -62,9 +65,11 @@ inline bool Validate(const uint8_t* bytes, size_t length) {
 			}
 		}
 	}
-	return depth == 0 && collections == 0 && featureBits == 63 * 8 &&
+	const bool valid = depth == 0 && collections == 0 && featureBits == 63 * 8 &&
 		outputBits == 9 * 8 &&
 		(inputBits[0] >= 17 * 8 || inputBits[1] >= 17 * 8 || inputBits[2] >= 17 * 8);
+	if (valid && hapticCommand) *hapticCommand = hapticBits == 3 * 8;
+	return valid;
 }
 
 } // namespace TritonHidDescriptor

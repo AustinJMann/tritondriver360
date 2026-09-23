@@ -23,7 +23,12 @@ struct FakeSource {
 	bool attached, retiring, retired;
 	unsigned published;
 	TritonProtocol::ControllerState state;
+	TritonProtocol::RightPadState rightPad;
+	bool sawRightPad;
 	uint64_t rumble;
+	bool haptic;
+	TrackpadHaptics::Pulse pulse;
+	unsigned hapticTakes;
 };
 static FakeSource routes[8];
 
@@ -60,9 +65,13 @@ bool ControllerAttachSource(uint32_t index, ControllerSourceToken* token) {
 static bool Live(ControllerSourceToken token) {
 	return ControllerRouting::TokenMatches(token, routes[token.index].epoch);
 }
-void ControllerPublishState(ControllerSourceToken token, const TritonProtocol::ControllerState& state) {
+void ControllerPublishState(ControllerSourceToken token,
+	const TritonProtocol::ControllerState& state,
+	const TritonProtocol::RightPadState* rightPad, uint32_t) {
 	assert(Live(token) && !routes[token.index].retiring);
 	routes[token.index].state = state;
+	routes[token.index].sawRightPad = rightPad != 0;
+	if (rightPad) routes[token.index].rightPad = *rightPad;
 	++routes[token.index].published;
 }
 void ControllerDisconnect(ControllerSourceToken token) {
@@ -78,14 +87,33 @@ bool ControllerSourceRetired(ControllerSourceToken token) {
 uint64_t ControllerReadRumbleRequest(ControllerSourceToken token) {
 	assert(Live(token)); return routes[token.index].rumble;
 }
+bool ControllerTakeHapticPulse(ControllerSourceToken token, uint32_t,
+	TrackpadHaptics::Pulse* pulse) {
+	assert(Live(token));
+	FakeSource& s = routes[token.index];
+	++s.hapticTakes;
+	if (!s.haptic) return false;
+	s.haptic = false;
+	*pulse = s.pulse;
+	return true;
+}
 
 // Synthetic protocol declarations, not a hardware capture.
-static const uint8_t hid[] = {
+static const uint8_t baseHid[] = {
 	0x06, 0x00, 0xff, 0x09, 1, 0xa1, 1,
 	0x75, 8, 0x85, 0x42, 0x95, 63, 0x81, 2,
 	0x85, 1, 0x95, 63, 0xb1, 2,
 	0x85, 0x80, 0x95, 9, 0x91, 2, 0xc0
 };
+static const uint8_t hapticHid[] = {
+	0x06, 0x00, 0xff, 0x09, 1, 0xa1, 1,
+	0x75, 8, 0x85, 0x42, 0x95, 63, 0x81, 2,
+	0x85, 1, 0x95, 63, 0xb1, 2,
+	0x85, 0x80, 0x95, 9, 0x91, 2,
+	0x85, 0x82, 0x95, 3, 0x91, 2, 0xc0
+};
+static const uint8_t* hid = baseHid;
+static uint32_t hidSize = sizeof(baseHid);
 
 static usb_interface_descriptor Interface(uint8_t number) {
 	usb_interface_descriptor d = { 9, 4, number, 0, 2, 3, 0, 0, 0 };
@@ -99,7 +127,7 @@ static std::vector<uint8_t> Configuration(bool puck, bool output = true) {
 		d.bNumEndpoints = output ? 2 : 1;
 		const uint8_t* p = (const uint8_t*)&d;
 		bytes.insert(bytes.end(), p, p + 9);
-		uint8_t hd[] = { 9, 0x21, 0x11, 1, 0, 1, 0x22, sizeof(hid), 0 };
+		uint8_t hd[] = { 9, 0x21, 0x11, 1, 0, 1, 0x22, (uint8_t)hidSize, 0 };
 		bytes.insert(bytes.end(), hd, hd + sizeof(hd));
 		uint8_t in[] = { 7, 5, (uint8_t)(0x81 + i), 3, 64, 0, 1 };
 		uint8_t out[] = { 7, 5, (uint8_t)(1 + i), 3, 64, 0, 1 };
@@ -129,7 +157,7 @@ static void CompleteInlineSetup(UsbSource* source) {
 	case kControlGetConfigurationHeader: Complete(trb, 0, &inlineConfiguration[0], 9); break;
 	case kControlGetConfigurationDescriptor:
 		Complete(trb, 0, &inlineConfiguration[0], (uint32_t)inlineConfiguration.size()); break;
-	case kControlGetHidDescriptor: Complete(trb, 0, hid, sizeof(hid)); break;
+	case kControlGetHidDescriptor: Complete(trb, 0, hid, hidSize); break;
 	case kControlGetCurrentConfiguration: { uint8_t value = 1; Complete(trb, 0, &value, 1); break; }
 	default: break;
 	}
@@ -143,7 +171,7 @@ static void CompleteSetup(UsbSource* source, const std::vector<uint8_t>& config)
 		switch (source->controlPurpose) {
 		case kControlGetConfigurationHeader: Complete(&control->trb, 0, &config[0], 9); break;
 		case kControlGetConfigurationDescriptor: Complete(&control->trb, 0, &config[0], (uint32_t)config.size()); break;
-		case kControlGetHidDescriptor: Complete(&control->trb, 0, hid, sizeof(hid)); break;
+		case kControlGetHidDescriptor: Complete(&control->trb, 0, hid, hidSize); break;
 		case kControlGetCurrentConfiguration: { uint8_t value = 1; Complete(&control->trb, 0, &value, 1); break; }
 		default: assert(false);
 		}
@@ -157,6 +185,7 @@ static void Reset() {
 	g_nextHeartbeatSlot = g_nextRumbleSlot = 0; clockMs = 0;
 	addCount = removeCount = 0; autoRetire = true;
 	inlineSetup = false;
+	hid = baseHid; hidSize = sizeof(baseHid);
 }
 
 static void TestWiredStartupInputAndStatus() {
@@ -177,6 +206,15 @@ static void TestWiredStartupInputAndStatus() {
 	assert(routes[4].published == 0 && !source->connected);
 	Complete(&source->extension->interruptTrb, 0, report, 18);
 	assert(routes[4].published == 1 && routes[4].state.a && source->connected);
+	assert(routes[4].sawRightPad && !routes[4].rightPad.coordinatesValid);
+	report[1] = 2; report[4] = 0x60;
+	report[24] = 0x34; report[25] = 0x12;
+	report[26] = 0xfe; report[27] = 0xff;
+	Complete(&source->extension->interruptTrb, 0, report, 30);
+	assert(routes[4].published == 2);
+	assert(routes[4].rightPad.coordinatesValid);
+	assert(routes[4].rightPad.contact && routes[4].rightPad.click);
+	assert(routes[4].rightPad.x == 0x1234 && routes[4].rightPad.y == -2);
 	uint8_t wireless[] = { 0x46, 1 };
 	Complete(&source->extension->interruptTrb, 0, wireless, 2);
 	assert(source->connected); // Wireless lifecycle does not apply to USB.
@@ -184,7 +222,7 @@ static void TestWiredStartupInputAndStatus() {
 	assert(!source->connected && FindPending(&source->extension->interruptTrb) < 0);
 	Tick(50); assert(FindPending(&source->extension->interruptTrb) >= 0);
 	Complete(&source->extension->interruptTrb, 0, report, 18);
-	assert(routes[4].published == 2);
+	assert(routes[4].published == 3);
 }
 
 static void TestDeviceIsolationAndCapacity() {
@@ -293,7 +331,7 @@ static void TestRejectedReportsAndConfigurationSelection() {
 	std::vector<uint8_t> config = Configuration(false);
 	Complete(control, 0, &config[0], 9); Tick();
 	Complete(control, 0, &config[0], (uint32_t)config.size()); Tick();
-	uint8_t bad[sizeof(hid)]; memcpy(bad, hid, sizeof(hid)); bad[18] = 62;
+	uint8_t bad[sizeof(baseHid)]; memcpy(bad, baseHid, sizeof(baseHid)); bad[18] = 62;
 	Complete(control, 0, bad, sizeof(bad)); Tick();
 	assert(source->device->failed && !source->listening && routes[4].published == 0);
 	Reset(); handle.driver = 0;
@@ -302,7 +340,7 @@ static void TestRejectedReportsAndConfigurationSelection() {
 	config[5] = 7;
 	Complete(control, 0, &config[0], 9); Tick();
 	Complete(control, 0, &config[0], (uint32_t)config.size()); Tick();
-	Complete(control, 0, hid, sizeof(hid)); Tick();
+	Complete(control, 0, baseHid, sizeof(baseHid)); Tick();
 	uint8_t unconfigured = 0; Complete(control, 0, &unconfigured, 1); Tick();
 	assert(source->controlPurpose == kControlSetConfiguration);
 	assert(Swap16(source->extension->controlTrb.packet.wValue) == 7);
@@ -323,6 +361,84 @@ static void TestSynchronousSetupAtClockWrap() {
 	assert(g_slots[4].device->controlOwner == 4);
 }
 
+static UsbSource* StartWired(deviceHandle* handle, bool haptics, bool output) {
+	Reset();
+	if (haptics) { hid = hapticHid; hidSize = sizeof(hapticHid); }
+	usb_interface_descriptor d = Interface(0);
+	assert(ControllerUsbAdd(handle, &d, ControllerUsbPolicy::kWiredTriton) == 0);
+	UsbSource* source = &g_slots[4];
+	CompleteSetup(source, Configuration(false, output));
+	UsbTrb* control = &source->extension->controlTrb.trb;
+	Complete(control, 0, 0, 64);
+	uint8_t report[18] = { 0x42 };
+	Complete(&source->extension->interruptTrb, 0, report, sizeof(report));
+	Tick(); // First valid state prioritizes raw mode once more.
+	if (source->controlPurpose == kControlLizardOff) Complete(control, 0, 0, 64);
+	return source;
+}
+
+static TrackpadHaptics::Pulse MakePulse(TrackpadHaptics::RequestKind kind, int8_t gainDb) {
+	TrackpadHaptics::Pulse pulse = { kind, gainDb, 1, 0 };
+	return pulse;
+}
+
+static void TestPadHapticOutput() {
+	// Without report 0x82 in the descriptor, pulses are never taken or sent.
+	deviceHandle handle = {};
+	UsbSource* source = StartWired(&handle, false, true);
+	assert(!source->hapticSupported && source->output);
+	routes[4].haptic = true; routes[4].pulse = MakePulse(TrackpadHaptics::kRequestClick, 21);
+	Tick();
+	assert(routes[4].hapticTakes == 0 && FindPending(&source->output->trb) < 0);
+
+	// Interrupt-OUT: a pulse goes before rumble, and they never overlap.
+	handle.driver = 0;
+	source = StartWired(&handle, true, true);
+	assert(source->hapticSupported && source->output);
+	UsbTrb* trb = &source->output->trb;
+	routes[4].rumble = RumbleOutput::Request(1, 1000, 2000);
+	routes[4].haptic = true; routes[4].pulse = MakePulse(TrackpadHaptics::kRequestClick, 21);
+	Tick();
+	assert(source->hapticPending && !source->rumble.pending);
+	const uint8_t click[] = { 0x82, 1, 2, 21 };
+	assert(trb->length == 4 && memcmp(source->output->report, click, sizeof(click)) == 0);
+	Tick(); assert(!source->rumble.pending); // The shared TRB is still in flight.
+	Complete(trb, 0, 0, 4);
+	assert(!source->hapticPending && source->rumble.pending); // Completion re-dispatches.
+	assert(trb->length == 10 && source->output->report[0] == 0x80);
+	routes[4].haptic = true; routes[4].pulse = MakePulse(TrackpadHaptics::kRequestMovement, 12);
+	Tick(); assert(!source->hapticPending && routes[4].haptic);
+	Complete(trb, 0, 0, 10);
+	assert(source->hapticPending && !routes[4].haptic);
+	assert(source->output->report[2] == 1 && source->output->report[3] == 12);
+	Complete(trb, 0, 0, 4);
+	routes[4].haptic = true; routes[4].pulse = MakePulse(TrackpadHaptics::kRequestRelease, 15);
+	Tick(); // A release uses the lighter command, not the press's strong click.
+	assert(source->hapticPending && source->output->report[2] == 1 && source->output->report[3] == 15);
+	Complete(trb, -1, 0, 0); // Failures are logged, never replayed.
+	assert(!source->hapticPending && source->hapticFailureCount == 1);
+	assert(FindPending(trb) < 0 || source->rumble.pending);
+
+	// Control fallback uses HID SET_REPORT Output 0x82.
+	handle.driver = 0;
+	source = StartWired(&handle, true, false);
+	assert(source->hapticSupported && !source->output);
+	routes[4].haptic = true; routes[4].pulse = MakePulse(TrackpadHaptics::kRequestMovement, 12);
+	Tick();
+	assert(source->controlPurpose == kControlHaptic);
+	UsbControlTrb* control = &source->extension->controlTrb;
+	assert(Swap16(control->packet.wValue) == 0x0282 && Swap16(control->packet.wLength) == 4);
+	assert(source->reports->haptic[0] == 0x82 && source->reports->haptic[1] == 1);
+	Complete(&control->trb, 0, 0, 4);
+	assert(!source->controlBusy && source->device->controlOwner == -1);
+
+	// Puck descriptors are not fetched; slots always accept pulses.
+	Reset(); deviceHandle puck = {}; usb_interface_descriptor d = Interface(2);
+	assert(ControllerUsbAdd(&puck, &d, ControllerUsbPolicy::kProteus) == 0);
+	CompleteSetup(&g_slots[0], Configuration(true));
+	assert(g_slots[0].hapticSupported);
+}
+
 int main() {
 	TestWiredStartupInputAndStatus();
 	TestDeviceIsolationAndCapacity();
@@ -331,6 +447,7 @@ int main() {
 	TestPuckActivityAndSharedControl();
 	TestRejectedReportsAndConfigurationSelection();
 	TestSynchronousSetupAtClockWrap();
+	TestPadHapticOutput();
 	puts("USB transport tests passed");
 	return 0;
 }

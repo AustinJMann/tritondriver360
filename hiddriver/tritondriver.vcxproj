@@ -101,6 +101,11 @@
     <ClInclude Include="rumble_output.h" />
     <ClInclude Include="triton_protocol.h" />
     <ClInclude Include="triton_config.h" />
+    <ClInclude Include="mouse_joystick.h" />
+    <ClInclude Include="trackball_motion.h" />
+    <ClInclude Include="trackpad_motion.h" />
+    <ClInclude Include="trackpad_haptics.h" />
+    <ClInclude Include="input_processing.h" />
     <ClInclude Include="usb.h" />
     <ClInclude Include="usb_descriptors.h" />
   </ItemGroup>
@@ -111,6 +116,11 @@
     <ClCompile Include="controller_usb.cpp" />
     <ClCompile Include="triton_protocol.cpp" />
     <ClCompile Include="triton_config.cpp" />
+    <ClCompile Include="mouse_joystick.cpp" />
+    <ClCompile Include="trackball_motion.cpp" />
+    <ClCompile Include="trackpad_motion.cpp" />
+    <ClCompile Include="trackpad_haptics.cpp" />
+    <ClCompile Include="input_processing.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />

@@ -3,6 +3,7 @@
 #include "driver_types.h"
 #include "controller_routing.h"
 #include "controller_usb_policy.h"
+#include "trackpad_haptics.h"
 #include "triton_protocol.h"
 
 int ControllerUsbAdd(deviceHandle* handle,
@@ -14,8 +15,12 @@ void ControllerUsbMaintenance(uint32_t nowMilliseconds);
 // Routing lives in main.cpp; only the binding worker calls XAM.
 bool ControllerAttachSource(uint32_t index, ControllerSourceToken* token);
 void ControllerPublishState(ControllerSourceToken token,
-	const TritonProtocol::ControllerState& state);
+	const TritonProtocol::ControllerState& state,
+	const TritonProtocol::RightPadState* rightPad, uint32_t nowMilliseconds);
 void ControllerDisconnect(ControllerSourceToken token);
 void ControllerRetireSource(ControllerSourceToken token);
 bool ControllerSourceRetired(ControllerSourceToken token);
 uint64_t ControllerReadRumbleRequest(ControllerSourceToken token);
+// Removes the pending right-pad pulse, if one is still fresh and bound.
+bool ControllerTakeHapticPulse(ControllerSourceToken token, uint32_t nowMilliseconds,
+	TrackpadHaptics::Pulse* pulse);

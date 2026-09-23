@@ -7,6 +7,11 @@
     <ClCompile Include="triton_protocol.cpp" />
     <ClCompile Include="triton_config.cpp" />
     <ClCompile Include="config_storage.cpp" />
+    <ClCompile Include="mouse_joystick.cpp" />
+    <ClCompile Include="trackball_motion.cpp" />
+    <ClCompile Include="trackpad_motion.cpp" />
+    <ClCompile Include="trackpad_haptics.cpp" />
+    <ClCompile Include="input_processing.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />
@@ -24,5 +29,10 @@
     <ClInclude Include="config_storage.h" />
     <ClInclude Include="usb.h" />
     <ClInclude Include="usb_descriptors.h" />
+    <ClInclude Include="mouse_joystick.h" />
+    <ClInclude Include="trackball_motion.h" />
+    <ClInclude Include="trackpad_motion.h" />
+    <ClInclude Include="trackpad_haptics.h" />
+    <ClInclude Include="input_processing.h" />
   </ItemGroup>
 </Project>
