@@ -11,6 +11,7 @@
 #include "rumble_output.h"
 #include "triton_protocol.h"
 #include "triton_config.h"
+#include "input_processing.h"
 #include "usb.h"
 
 static const int kControllerCount = 4;
@@ -102,10 +103,22 @@ __declspec(align(8)) volatile LONG64 g_rumbleRequests[ControllerRouting::kSlotCo
 static volatile LONG g_abortServiceStartup;
 static volatile LONG g_nextReadyOrder;
 static TritonConfig::Config g_config;
+// Parse target for reloads. Only the binding worker uses it.
+static TritonConfig::Config g_reloadedConfig;
 static const TritonConfig::Profile* volatile g_activeProfile;
 static volatile LONG g_profileEpoch;
 static DWORD g_activeTitleId;
 static bool g_hasActiveTitle;
+static InputProcessing::RightTrackpadProcessor g_inputProcessors[ControllerRouting::kSlotCount];
+static uint32_t g_processingAttachmentEpoch[ControllerRouting::kSlotCount];
+static LONG g_processingProfileEpoch[ControllerRouting::kSlotCount];
+static bool g_rightPadContact[ControllerRouting::kSlotCount];
+static bool g_rightPadClick[ControllerRouting::kSlotCount];
+static TritonConfig::Profile g_processingProfiles[ControllerRouting::kSlotCount];
+static uint8_t g_rightPadSequence[ControllerRouting::kSlotCount];
+static bool g_rightPadSequenceValid[ControllerRouting::kSlotCount];
+// Produced and consumed on the serialized USB processor context.
+static TrackpadHaptics::Mailbox g_hapticPulses[ControllerRouting::kSlotCount];
 
 uint16_t Swap16(uint16_t value) { return (uint16_t)((value >> 8) | (value << 8)); }
 
@@ -116,9 +129,10 @@ BOOL IsTrayOpen() {
 	return output[1] == 0x60;
 }
 
-HANDLE MakeSystemThread(LPTHREAD_START_ROUTINE entry, PVOID argument) {
+HANDLE MakeSystemThread(LPTHREAD_START_ROUTINE entry, PVOID argument,
+	DWORD stackSize = 0) {
 	HANDLE thread = 0;
-	ExCreateThread(&thread, 0, 0, XapiThreadStartup, entry, argument,
+	ExCreateThread(&thread, stackSize, 0, XapiThreadStartup, entry, argument,
 		EX_CREATE_FLAG_SUSPENDED | EX_CREATE_FLAG_SYSTEM | 0x18000424);
 	if (!thread) return 0;
 	XSetThreadProcessor(thread, kUsbProcessor);
@@ -130,6 +144,14 @@ void InitializeRouting() {
 	memset(g_controllers, 0, sizeof(g_controllers));
 	memset(g_sources, 0, sizeof(g_sources));
 	memset((void*)g_rumbleRequests, 0, sizeof(g_rumbleRequests));
+	memset(g_processingAttachmentEpoch, 0, sizeof(g_processingAttachmentEpoch));
+	memset(g_processingProfileEpoch, 0, sizeof(g_processingProfileEpoch));
+	memset(g_rightPadContact, 0, sizeof(g_rightPadContact));
+	memset(g_rightPadClick, 0, sizeof(g_rightPadClick));
+	memset(g_processingProfiles, 0, sizeof(g_processingProfiles));
+	memset(g_rightPadSequence, 0, sizeof(g_rightPadSequence));
+	memset(g_rightPadSequenceValid, 0, sizeof(g_rightPadSequenceValid));
+	for (int i = 0; i < ControllerRouting::kSlotCount; ++i) g_hapticPulses[i].Reset();
 	TritonConfig::Initialize(&g_config);
 	g_activeProfile = &g_config.defaults;
 	g_profileEpoch = 0;
@@ -137,6 +159,66 @@ void InitializeRouting() {
 	for (int i = 0; i < ControllerRouting::kSlotCount; ++i) {
 		g_sources[i].controllerIndex = ControllerRouting::kUnboundController;
 		g_sources[i].generation = 1;
+		TrackpadMotion::Geometry geometry = { -32768, 32767, -32768, 32767,
+			false, false };
+		g_inputProcessors[i].SetGeometry(geometry);
+	}
+}
+
+const TritonConfig::Profile* ReadActiveProfile();
+
+bool SyncProcessingProfile(int index, uint32_t attachmentEpoch, uint32_t now) {
+	LONG before = InterlockedCompareExchange(&g_profileEpoch, 0, 0);
+	if (before & 1) return false;
+	if (g_processingAttachmentEpoch[index] == attachmentEpoch &&
+		g_processingProfileEpoch[index] == before) return true;
+	MemoryBarrier();
+	// Config reloads rewrite profiles in place, so copy before validating the epoch.
+	TritonConfig::Profile profile = *ReadActiveProfile();
+	MemoryBarrier();
+	LONG after = InterlockedCompareExchange(&g_profileEpoch, 0, 0);
+	if (before != after) return false;
+	g_processingProfiles[index] = profile;
+	g_inputProcessors[index].SetProfile(g_processingProfiles[index], g_rightPadContact[index],
+		g_rightPadClick[index], now);
+	g_processingAttachmentEpoch[index] = attachmentEpoch;
+	g_processingProfileEpoch[index] = after;
+	return true;
+}
+
+void PublishSnapshot(ControllerRoutingSlot& slot,
+	const TritonProtocol::ControllerState& state) {
+	InterlockedIncrement(&slot.stateSequence);
+	LONG next = 1 - slot.publishedStateIndex;
+	slot.stateBuffers[next] = state;
+	MemoryBarrier();
+	InterlockedExchange(&slot.publishedStateIndex, next);
+	InterlockedIncrement(&slot.stateSequence);
+}
+
+// Caller must have saved the DPC floating-point state.
+void OfferHapticPulse(int index, const TrackpadHaptics::Request& request, uint32_t now) {
+	if (request.kind == TrackpadHaptics::kRequestNone) return;
+	ControllerRoutingSlot& slot = g_sources[index];
+	// Like rumble, pad feedback belongs to the current player binding.
+	if (slot.controllerIndex < 0) return;
+	g_hapticPulses[index].Offer(request.kind, TrackpadHaptics::GainDb(request.intensity),
+		(uint32_t)slot.generation, now);
+}
+
+void ControllerAdvanceInputProcessing(uint32_t now) {
+	for (int i = 0; i < ControllerRouting::kSlotCount; ++i) {
+		ControllerRoutingSlot& slot = g_sources[i];
+		uint32_t attachmentEpoch = (uint32_t)slot.attachmentEpoch;
+		if (!slot.connected || slot.retiring || !attachmentEpoch) continue;
+		if (!SyncProcessingProfile(i, attachmentEpoch, now)) continue;
+		InputProcessing::Output output = g_inputProcessors[i].Advance(now);
+		OfferHapticPulse(i, output.haptic, now);
+		g_rightPadContact[i] = g_inputProcessors[i].HasContact();
+		TritonConfig::ApplyPaddleBindings(g_processingProfiles[i], &output.state);
+		if (slot.connected && !slot.retiring &&
+			(uint32_t)slot.attachmentEpoch == attachmentEpoch)
+			PublishSnapshot(slot, output.state);
 	}
 }
 
@@ -161,11 +243,17 @@ void StopRumbleForTitleChange() {
 
 void ActivateTitleProfile(DWORD titleId) {
 	if (g_hasActiveTitle && titleId == g_activeTitleId) return;
-	const TritonConfig::Profile* profile = TritonConfig::FindProfile(g_config, titleId);
-	// Odd epochs reject rumble publication while the active title changes.
+	// DllMain has just loaded the config, so only later title changes reload it.
+	bool reloaded = g_hasActiveTitle && ConfigStorage::Reload(&g_reloadedConfig);
+	// Odd epochs reject rumble publication and profile copies while the
+	// config and active title change.
 	InterlockedIncrement(&g_profileEpoch);
+	MemoryBarrier();
+	if (reloaded) g_config = g_reloadedConfig;
+	const TritonConfig::Profile* profile = TritonConfig::FindProfile(g_config, titleId);
 	InterlockedExchange((volatile LONG*)&g_activeProfile, (LONG)profile);
 	StopRumbleForTitleChange();
+	MemoryBarrier();
 	InterlockedIncrement(&g_profileEpoch);
 	g_activeTitleId = titleId;
 	g_hasActiveTitle = true;
@@ -315,6 +403,11 @@ DWORD WINAPI ControllerServiceThreadProc(void*) {
 		// per-slot inputPending/controlBusy flags cannot protect those lists.
 		BYTE previousIrql = KfRaiseIrql(kUsbDispatchLevel);
 		ControllerUsbMaintenance(now);
+		// Input processing uses the FPU. DPC-level code must preserve the
+		// interrupted thread's floating-point state explicitly on Xbox 360.
+		XSaveFloatingPointStateForDpc();
+		ControllerAdvanceInputProcessing(now);
+		XRestoreFloatingPointStateForDpc();
 		KfLowerIrql(previousIrql);
 		Sleep(RumbleOutput::kServiceMs);
 	}
@@ -421,7 +514,9 @@ private:
 DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration) {
 	LONG profileEpoch = InterlockedCompareExchange(&g_profileEpoch, 0, 0);
 	if (profileEpoch & 1) return ERROR_BUSY;
+	MemoryBarrier();
 	RumbleOutput::Settings settings = ReadActiveProfile()->rumble;
+	MemoryBarrier();
 	if (InterlockedCompareExchange(&g_profileEpoch, 0, 0) != profileEpoch)
 		return ERROR_BUSY;
 	XboxRumbleBackend backend(profileEpoch);
@@ -524,7 +619,6 @@ NTSTATUS XInputdReadStateHook(DWORD context, PDWORD packetNumber,
 		if (!slot.connected || slot.controllerIndex != controllerIndex ||
 			(uint32_t)slot.generation != generation) memset(&state, 0, sizeof(state));
 	}
-	TritonConfig::ApplyPaddleBindings(*ReadActiveProfile(), &state);
 	memset(output, 0, sizeof(*output));
 	if (state.guide) {
 		DWORD now = GetTickCount();
@@ -623,16 +717,46 @@ bool SourceMatches(ControllerSourceToken token) {
 }
 
 void ControllerPublishState(ControllerSourceToken token,
-	const TritonProtocol::ControllerState& state) {
+	const TritonProtocol::ControllerState& state,
+	const TritonProtocol::RightPadState* rightPad, uint32_t now) {
 	if (!SourceMatches(token)) return;
 	ControllerRoutingSlot& slot = g_sources[token.index];
 	if (slot.retiring) return;
-	InterlockedIncrement(&slot.stateSequence);
-	LONG next = 1 - slot.publishedStateIndex;
-	slot.stateBuffers[next] = state;
-	MemoryBarrier();
-	InterlockedExchange(&slot.publishedStateIndex, next);
-	InterlockedIncrement(&slot.stateSequence);
+	// USB input completion runs as a DPC. The trackpad pipeline performs
+	// floating-point math and must not corrupt the interrupted thread's FPU
+	// registers.
+	XSaveFloatingPointStateForDpc();
+	SyncProcessingProfile((int)token.index, token.attachmentEpoch, now);
+	InputProcessing::Output output;
+	bool newPadSample = rightPad && (!g_rightPadSequenceValid[token.index] ||
+		g_rightPadSequence[token.index] != rightPad->sequence);
+	if (rightPad && newPadSample) {
+		g_rightPadSequence[token.index] = rightPad->sequence;
+		g_rightPadSequenceValid[token.index] = true;
+	}
+	if (rightPad && !newPadSample) {
+		output = g_inputProcessors[token.index].UpdatePhysical(state, now);
+	} else if (rightPad && rightPad->coordinatesValid) {
+		g_rightPadContact[token.index] = rightPad->contact;
+		g_rightPadClick[token.index] = rightPad->click;
+		output = g_inputProcessors[token.index].ProcessSample(state,
+			rightPad->contact, rightPad->x, rightPad->y, rightPad->click, now);
+	} else if (rightPad && !rightPad->contact && g_rightPadContact[token.index]) {
+		g_rightPadContact[token.index] = false;
+		g_rightPadClick[token.index] = rightPad->click;
+		output = g_inputProcessors[token.index].ProcessSample(state,
+			false, 0, 0, rightPad->click, now);
+	} else if (rightPad) {
+		g_rightPadClick[token.index] = rightPad->click;
+		output = g_inputProcessors[token.index].ProcessButtons(state,
+			rightPad->click, now);
+	} else {
+		output = g_inputProcessors[token.index].UpdatePhysical(state, now);
+	}
+	OfferHapticPulse((int)token.index, output.haptic, now);
+	TritonConfig::ApplyPaddleBindings(g_processingProfiles[token.index], &output.state);
+	PublishSnapshot(slot, output.state);
+	XRestoreFloatingPointStateForDpc();
 	if (!slot.connected) InterlockedExchange(&slot.readyOrder, InterlockedIncrement(&g_nextReadyOrder));
 	InterlockedExchange(&slot.connected, 1);
 }
@@ -641,6 +765,16 @@ void ControllerDisconnect(ControllerSourceToken token) {
 	if (!SourceMatches(token)) return;
 	ControllerRoutingSlot& slot = g_sources[token.index];
 	InterlockedExchange64(&g_rumbleRequests[token.index], 0);
+	// Reset emits floating-point stores and can be reached from a USB completion
+	// DPC, just like normal input processing.
+	XSaveFloatingPointStateForDpc();
+	g_inputProcessors[token.index].Reset();
+	XRestoreFloatingPointStateForDpc();
+	g_hapticPulses[token.index].Reset();
+	g_processingAttachmentEpoch[token.index] = 0;
+	g_rightPadContact[token.index] = false;
+	g_rightPadClick[token.index] = false;
+	g_rightPadSequenceValid[token.index] = false;
 	InterlockedExchange(&slot.connected, 0);
 	InterlockedExchange(&slot.disconnectPending, 1);
 }
@@ -677,6 +811,19 @@ uint64_t ControllerReadRumbleRequest(ControllerSourceToken token) {
 	return request;
 }
 
+bool ControllerTakeHapticPulse(ControllerSourceToken token, uint32_t now,
+	TrackpadHaptics::Pulse* pulse) {
+	if (!SourceMatches(token)) return false;
+	ControllerRoutingSlot& slot = g_sources[token.index];
+	if (slot.retiring) return false;
+	TrackpadHaptics::Pulse taken;
+	if (!g_hapticPulses[token.index].Take(now, &taken)) return false;
+	if (!slot.connected || slot.disconnectPending || slot.controllerIndex < 0 ||
+		taken.generation != (uint32_t)slot.generation) return false;
+	*pulse = taken;
+	return true;
+}
+
 BOOL APIENTRY DllMain(HANDLE, DWORD reason, PVOID) {
 	if (reason != DLL_PROCESS_ATTACH) return TRUE;
 	if ((XboxKrnlVersion->Build != 17559 && XboxKrnlVersion->Build != 17489) || IsTrayOpen()) {
@@ -694,7 +841,8 @@ BOOL APIENTRY DllMain(HANDLE, DWORD reason, PVOID) {
 	// FALSE with live hooks would leave kernel calls targeting an unloaded DLL.
 	HANDLE serviceThread = MakeSystemThread(ControllerServiceThreadProc, 0);
 	if (!serviceThread) return FALSE;
-	HANDLE bindingThread = MakeSystemThread(ControllerBindingThreadProc, 0);
+	// Config reloads parse on the binding worker, which holds a Config on its stack.
+	HANDLE bindingThread = MakeSystemThread(ControllerBindingThreadProc, 0, 64 * 1024);
 	if (!bindingThread) {
 		// No hooks are installed, and the USB worker has never been resumed.
 		InterlockedExchange(&g_abortServiceStartup, 1);

@@ -11,8 +11,21 @@ static const uint16_t kProteusProductId = 0x1304;
 static const uint8_t kFirstSlotInterface = 2;
 static const uint8_t kLastSlotInterface = 5;
 static const size_t kInputPrefixSize = 18;
+static const size_t kInputTouchSize = 30;
+static const size_t kTimestampInputTouchSize = 32;
 static const size_t kFeatureReportSize = 64;
 static const size_t kRumbleReportSize = 10;
+static const size_t kHapticCommandReportSize = 4;
+
+// Report 0x82 side values; report 0x81 orders the trackpads differently.
+static const uint8_t kHapticSideLeftPad = 0;
+static const uint8_t kHapticSideRightPad = 1;
+
+enum HapticCommand {
+	kHapticStopAll = 0,
+	kHapticClick = 1,
+	kHapticClickStrong = 2
+};
 
 enum WirelessStatus {
 	kWirelessStatusUnknown = 0,
@@ -30,6 +43,18 @@ struct InputState {
 	int16_t leftY;
 	int16_t rightX;
 	int16_t rightY;
+};
+
+struct RightPadState {
+	uint8_t sequence;
+	bool coordinatesValid;
+	bool timestampValid;
+	bool contact;
+	bool click;
+	int16_t x;
+	int16_t y;
+	uint16_t pressure;
+	uint16_t timestamp;
 };
 
 #pragma pack(push, 1)
@@ -72,10 +97,13 @@ bool IsProteusSlotInterface(uint16_t vendorId, uint16_t productId,
 	uint8_t interfaceNumber, uint8_t interfaceClass,
 	uint8_t interfaceSubClass, uint8_t interfaceProtocol);
 bool DecodeInputPrefix(const uint8_t* bytes, size_t length, InputState* state);
+bool DecodeRightPad(const uint8_t* bytes, size_t length, RightPadState* state);
 bool DecodeWirelessStatus(const uint8_t* bytes, size_t length, WirelessStatus* status);
 void ConvertToControllerState(const InputState& state, ControllerState* stateOut);
 void BuildLizardOffFeatureReport(uint8_t report[kFeatureReportSize]);
 void BuildRumbleOutputReport(uint16_t left, uint16_t right,
 	uint8_t report[kRumbleReportSize]);
+void BuildHapticCommandReport(uint8_t side, HapticCommand command, int8_t gainDb,
+	uint8_t report[kHapticCommandReportSize]);
 
 } // namespace TritonProtocol

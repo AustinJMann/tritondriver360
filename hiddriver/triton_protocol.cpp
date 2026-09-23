@@ -33,6 +33,8 @@ static const uint32_t kButtonL5 = 0x00040000;
 static const uint32_t kButtonLB = 0x00080000;
 static const uint32_t kButtonRTClick = 0x00800000;
 static const uint32_t kButtonLTClick = 0x08000000;
+static const uint32_t kRightPadTouch = 0x00200000;
+static const uint32_t kRightPadClick = 0x00400000;
 
 static uint16_t ClampTrigger(int16_t value) {
 	if (value <= 0) return 0;
@@ -85,6 +87,35 @@ bool DecodeInputPrefix(const uint8_t* bytes, size_t length, InputState* state) {
 	decoded.leftY = ReadSLE16(bytes + 12);
 	decoded.rightX = ReadSLE16(bytes + 14);
 	decoded.rightY = ReadSLE16(bytes + 16);
+	*state = decoded;
+	return true;
+}
+
+bool DecodeRightPad(const uint8_t* bytes, size_t length, RightPadState* state) {
+	if (!bytes || !state || length < kInputPrefixSize) return false;
+	if (bytes[0] != kStateReport42 && bytes[0] != kStateReport45 &&
+		bytes[0] != kStateReport47) return false;
+	RightPadState decoded;
+	memset(&decoded, 0, sizeof(decoded));
+	decoded.sequence = bytes[1];
+	const uint32_t buttons = ReadLE32(bytes + 2);
+	decoded.contact = (buttons & kRightPadTouch) != 0;
+	decoded.click = (buttons & kRightPadClick) != 0;
+	if (bytes[0] == kStateReport47) {
+		if (length >= kTimestampInputTouchSize) {
+			decoded.timestampValid = true;
+			decoded.timestamp = ReadLE16(bytes + 18);
+			decoded.coordinatesValid = true;
+			decoded.x = ReadSLE16(bytes + 26);
+			decoded.y = ReadSLE16(bytes + 28);
+			decoded.pressure = ReadLE16(bytes + 30);
+		}
+	} else if (length >= kInputTouchSize) {
+		decoded.coordinatesValid = true;
+		decoded.x = ReadSLE16(bytes + 24);
+		decoded.y = ReadSLE16(bytes + 26);
+		decoded.pressure = ReadLE16(bytes + 28);
+	}
 	*state = decoded;
 	return true;
 }
@@ -151,6 +182,15 @@ void BuildRumbleOutputReport(uint16_t left, uint16_t right,
 	report[5] = (uint8_t)(left >> 8);
 	report[7] = (uint8_t)right;
 	report[8] = (uint8_t)(right >> 8);
+}
+
+void BuildHapticCommandReport(uint8_t side, HapticCommand command, int8_t gainDb,
+	uint8_t report[kHapticCommandReportSize]) {
+	// SDL's MsgHapticCommand: side, command, gain_db.
+	report[0] = 0x82;
+	report[1] = side;
+	report[2] = (uint8_t)command;
+	report[3] = (uint8_t)gainDb;
 }
 
 } // namespace TritonProtocol

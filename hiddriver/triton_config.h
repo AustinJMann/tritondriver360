@@ -4,6 +4,9 @@
 #include <stdint.h>
 
 #include "rumble_output.h"
+#include "mouse_joystick.h"
+#include "trackball_motion.h"
+#include "trackpad_haptics.h"
 #include "triton_protocol.h"
 
 namespace TritonConfig {
@@ -39,9 +42,24 @@ enum Binding {
 	kBindingRightTrigger
 };
 
+enum RightTrackpadMode {
+	kRightTrackpadDisabled,
+	kRightTrackpadMouseJoystick
+};
+
+struct RightTrackpadSettings {
+	RightTrackpadMode mode;
+	Binding clickAction;
+	TrackballMotion::Settings trackball;
+	TrackpadHaptics::Settings haptics;
+	float physicalStickThreshold;
+};
+
 struct Profile {
 	Binding paddles[kPaddleCount];
 	RumbleOutput::Settings rumble;
+	MouseJoystick::Settings mouseJoystick;
+	RightTrackpadSettings rightTrackpad;
 };
 
 struct GameProfile {
@@ -64,6 +82,7 @@ void Initialize(Config* config);
 bool Parse(const char* text, size_t length, Config* config, ParseError* error);
 const Profile* FindProfile(const Config& config, uint32_t titleId);
 void ApplyPaddleBindings(const Profile& profile, TritonProtocol::ControllerState* state);
+void ApplyBinding(Binding binding, TritonProtocol::ControllerState* state);
 const char* DefaultFileText();
 size_t DefaultFileSize();
 

@@ -14,8 +14,9 @@ static const char kConfigName[] = "tritonconfig.yml";
 static const ACCESS_MASK kSynchronizeAccess = 0x00100000L;
 static const DWORD kFileOpen = 1;
 static const DWORD kFileCreate = 2;
+static const NTSTATUS kStatusSharingViolation = (NTSTATUS)0xC0000043L;
 
-enum ReadResult { kReadMissing, kReadLoaded, kReadInvalid };
+enum ReadResult { kReadMissing, kReadLoaded, kReadInvalid, kReadBusy };
 
 struct NativePaths {
 	char usb[kMaxUsbDevices][MAX_PATH];
@@ -80,7 +81,9 @@ ReadResult ReadConfig(const char* path, TritonConfig::Config* config) {
 	if (!NT_SUCCESS(status)) {
 		DbgPrint("TritonDriver: config not available at %s status %08X\n",
 			path, (unsigned int)status);
-		return kReadMissing;
+		// A file held open for writing exists, so it must not fall through to
+		// a lower-priority location.
+		return status == kStatusSharingViolation ? kReadBusy : kReadMissing;
 	}
 
 	// Read one byte beyond the accepted limit so oversized files are detected
@@ -150,25 +153,29 @@ bool WriteDefault(const char* path) {
 	return true;
 }
 
+// Reads the highest-priority config. An unreadable USB file shadows Hdd1.
+// config is written only when the result is kReadLoaded.
+ReadResult ReadFirst(const NativePaths& paths, TritonConfig::Config* config) {
+	bool unreadableUsbConfig = false;
+	for (DWORD i = 0; i < kMaxUsbDevices; ++i) {
+		ReadResult result = ReadConfig(paths.usb[i], config);
+		if (result == kReadLoaded) return kReadLoaded;
+		if (result != kReadMissing) unreadableUsbConfig = true;
+	}
+	if (unreadableUsbConfig) return kReadInvalid;
+	ReadResult result = ReadConfig(paths.hdd, config);
+	return result == kReadBusy ? kReadInvalid : result;
+}
+
 } // namespace
 
 bool LoadOrCreate(TritonConfig::Config* config) {
 	NativePaths paths;
 	BuildNativePaths(&paths);
 
-	bool invalidUsbConfig = false;
-	for (DWORD i = 0; i < kMaxUsbDevices; ++i) {
-		ReadResult result = ReadConfig(paths.usb[i], config);
-		if (result == kReadLoaded) return true;
-		if (result == kReadInvalid) invalidUsbConfig = true;
-	}
-	if (invalidUsbConfig) {
-		TritonConfig::Initialize(config);
-		return false;
-	}
-	ReadResult hddResult = ReadConfig(paths.hdd, config);
-	if (hddResult == kReadLoaded) return true;
-	if (hddResult == kReadInvalid) {
+	ReadResult result = ReadFirst(paths, config);
+	if (result == kReadLoaded) return true;
+	if (result == kReadInvalid) {
 		TritonConfig::Initialize(config);
 		return false;
 	}
@@ -184,6 +191,14 @@ bool LoadOrCreate(TritonConfig::Config* config) {
 	if (WriteDefault(paths.hdd)) return true;
 	DbgPrint("TritonDriver: no writable config location; using generated defaults in memory\n");
 	return true;
+}
+
+bool Reload(TritonConfig::Config* config) {
+	NativePaths paths;
+	BuildNativePaths(&paths);
+	if (ReadFirst(paths, config) == kReadLoaded) return true;
+	DbgPrint("TritonDriver: config reload failed; keeping current settings\n");
+	return false;
 }
 
 } // namespace ConfigStorage

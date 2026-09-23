@@ -9,4 +9,8 @@ namespace ConfigStorage {
 // exists. Existing invalid files are never overwritten.
 bool LoadOrCreate(TritonConfig::Config* config);
 
+// Reads the config using the same search order without creating files.
+// config is written only when a file loads successfully.
+bool Reload(TritonConfig::Config* config);
+
 } // namespace ConfigStorage

@@ -39,22 +39,26 @@ enum ControlPurpose {
 	kControlGetCurrentConfiguration,
 	kControlSetConfiguration,
 	kControlLizardOff,
-	kControlRumble
+	kControlRumble,
+	kControlHaptic
 };
 
 // Separate allocation: preserve the kernel-observed extension layout and retain
 // output TRB/data storage through removal just like the existing input storage.
-struct RumbleTransfer {
+// Rumble and pad haptics share this TRB, so at most one of them is in flight.
+struct OutputTransfer {
 	UsbTrb trb;
 	// The kernel writes the completed byte count at TRB+0x1c. UsbTrb models
 	// only the 0x1c-byte prefix; never place the HID payload in that field.
 	uint32_t transferredBytes;
 	uint8_t report[TritonProtocol::kRumbleReportSize];
 };
-static_assert(offsetof(RumbleTransfer, transferredBytes) == 0x1c,
+static_assert(offsetof(OutputTransfer, transferredBytes) == 0x1c,
 	"USB completion byte count offset changed");
-static_assert(offsetof(RumbleTransfer, report) == 0x20,
+static_assert(offsetof(OutputTransfer, report) == 0x20,
 	"Output report overlaps USB transfer bookkeeping");
+static_assert(TritonProtocol::kHapticCommandReportSize <= TritonProtocol::kRumbleReportSize,
+	"Haptic report does not fit the shared output buffer");
 
 struct UsbDeviceContext {
 	bool configured;
@@ -62,6 +66,7 @@ struct UsbDeviceContext {
 	bool descriptorFetched;
 	bool currentConfigurationKnown;
 	bool hidValidated;
+	bool hapticCommand;
 	bool failed;
 	uint8_t currentConfiguration;
 	uint16_t descriptorLength;
@@ -74,6 +79,7 @@ struct UsbDeviceContext {
 struct ControlReports {
 	uint8_t feature[TritonProtocol::kFeatureReportSize];
 	uint8_t rumble[TritonProtocol::kRumbleReportSize];
+	uint8_t haptic[TritonProtocol::kHapticCommandReportSize];
 };
 struct UsbSource {
 	UsbDeviceContext* device;
@@ -87,9 +93,12 @@ struct UsbSource {
 	uint16_t inputLength;
 	ControlReports* reports;
 	RumbleOutput::State rumble;
-	RumbleTransfer* output;
+	OutputTransfer* output;
 	uint8_t outputEndpoint;
 	bool loggedRumbleWait;
+	bool hapticSupported;
+	bool hapticPending;
+	uint8_t hapticFailureCount;
 	usb_endpoint_descriptor endpointDescriptor;
 	uint32_t heartbeatDeadline;
 	uint32_t inputRetryDeadline;
@@ -207,6 +216,7 @@ static bool QueueLizardOff(UsbSource* slot) {
 
 static bool QueueRumble(UsbSource* slot, uint32_t now) {
 	if (slot->removing || !slot->rumble.Due(now)) return false;
+	if (slot->output && slot->hapticPending) return false;
 	if (!slot->output && (slot->controlBusy || slot->device->controlOwner != -1)) return false;
 	uint8_t* report = slot->output ? slot->output->report : slot->reports->rumble;
 	TritonProtocol::BuildRumbleOutputReport(RumbleOutput::Left(slot->rumble.desired),
@@ -226,6 +236,44 @@ static bool QueueRumble(UsbSource* slot, uint32_t now) {
 		slot->interfaceNumber, TritonProtocol::kRumbleReportSize, report)) return true;
 	slot->rumble.pending = false;
 	return false;
+}
+
+// Pulses are one-shot: a pulse that cannot be sent now is superseded or expires,
+// and failures are not retried so stale feedback never plays late.
+static bool QueueHaptic(UsbSource* slot, uint32_t now) {
+	if (slot->removing || !slot->hapticSupported || slot->hapticPending) return false;
+	if (slot->output ? slot->rumble.pending :
+		(slot->controlBusy || slot->device->controlOwner != -1)) return false;
+	TrackpadHaptics::Pulse pulse;
+	if (!ControllerTakeHapticPulse(slot->token, now, &pulse)) return false;
+	uint8_t* report = slot->output ? slot->output->report : slot->reports->haptic;
+	TritonProtocol::BuildHapticCommandReport(TritonProtocol::kHapticSideRightPad,
+		pulse.kind == TrackpadHaptics::kRequestClick ?
+			TritonProtocol::kHapticClickStrong : TritonProtocol::kHapticClick,
+		pulse.gainDb, report);
+	if (slot->output) {
+		// Mark pending before queueing: completion may run before the API returns.
+		slot->hapticPending = true;
+		UsbTrb* trb = &slot->output->trb;
+		trb->buffer = report;
+		trb->length = TritonProtocol::kHapticCommandReportSize;
+		UsbdQueueAsyncTransfer(slot->handle, trb);
+		return true;
+	}
+	// HID Output (2), report 0x82, including the report ID.
+	return QueueControl(slot, kControlHaptic, 0x21, 0x09, 0x0282, slot->interfaceNumber,
+		TritonProtocol::kHapticCommandReportSize, report);
+}
+
+static void FinishHaptic(UsbSource* slot, int32_t status) {
+	if (status == 0) {
+		slot->hapticFailureCount = 0;
+		return;
+	}
+	if (slot->hapticFailureCount < 255) ++slot->hapticFailureCount;
+	if (slot->hapticFailureCount <= 3)
+		DbgPrint("TritonDriver: pad haptic USB failed interface %d status %x\n",
+			slot->interfaceNumber, status);
 }
 
 static UsbSource* FindSlotByInterruptTrb(void* trb) {
@@ -250,7 +298,7 @@ static void OpenRumbleEndpoint(UsbSource* slot) {
 		DbgPrint("TritonDriver: rumble invalid interrupt-OUT size %d interface %d\n", packetSize, slot->interfaceNumber);
 		return;
 	}
-	RumbleTransfer* output = (RumbleTransfer*)calloc(1, sizeof(RumbleTransfer));
+	OutputTransfer* output = (OutputTransfer*)calloc(1, sizeof(OutputTransfer));
 	if (!output) return;
 	NTSTATUS status = UsbdOpenEndpoint(slot->handle, 3, endpoint.bEndpointAddress,
 		packetSize, endpoint.bInterval, (DWORD*)&output->trb);
@@ -304,6 +352,9 @@ static bool StartListening(UsbSource* slot) {
 	// the queue implementation may reuse trb.endpoint while the request runs.
 	inputTrb->savedEndpoint = inputTrb->endpoint;
 	OpenRumbleEndpoint(slot);
+	// The puck's descriptors are not fetched; it forwards SDL-sized reports.
+	slot->hapticSupported = slot->kind == ControllerUsbPolicy::kProteus ||
+		slot->device->hapticCommand;
 	slot->listening = true;
 	DbgPrint("TritonDriver: USB interface %d listening endpoint %02x size %d interval %d\n",
 		slot->interfaceNumber, endpoint->bEndpointAddress, packetSize, endpoint->bInterval);
@@ -374,7 +425,14 @@ static int32_t OutputComplete(DWORD trbAddress, int32_t status) {
 		if (!slot->output || &slot->output->trb != (void*)trbAddress) continue;
 		if (slot->removing) {
 			slot->rumble.pending = false;
+			slot->hapticPending = false;
 			UpdateRemovalReady(slot);
+			return status;
+		}
+		if (slot->hapticPending) {
+			slot->hapticPending = false;
+			FinishHaptic(slot, status);
+			DispatchOutputs(now);
 			return status;
 		}
 		if (!slot->rumble.pending) return status;
@@ -395,13 +453,21 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 	slot->controlPurpose = kControlNone;
 	if (slot->removing) {
 		slot->controlBusy = false;
-		if (purpose != kControlRumble && purpose != kControlLizardOff)
+		if (purpose != kControlRumble && purpose != kControlHaptic &&
+			purpose != kControlLizardOff)
 			slot->device->configurationBusy = false;
 		UpdateRemovalReady(slot);
 		return status;
 	}
 	if (purpose == kControlRumble) {
 		FinishRumble(slot, status, now);
+		slot->controlBusy = false;
+		StartNextConfiguration();
+		DispatchOutputs(now);
+		return status;
+	}
+	if (purpose == kControlHaptic) {
+		FinishHaptic(slot, status);
 		slot->controlBusy = false;
 		StartNextConfiguration();
 		DispatchOutputs(now);
@@ -440,7 +506,8 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 			}
 		} else if (purpose == kControlGetHidDescriptor) {
 			device->hidValidated = length == device->hidLength &&
-				TritonHidDescriptor::Validate(device->hidDescriptor, length);
+				TritonHidDescriptor::Validate(device->hidDescriptor, length,
+					&device->hapticCommand);
 			if (!device->hidValidated) device->failed = true;
 		} else if (purpose == kControlGetCurrentConfiguration) {
 			if (length != 1) device->failed = true;
@@ -515,7 +582,8 @@ static void DispatchOutputs(uint32_t now) {
 		UsbSource* slot = &g_slots[i];
 		if (!slot->handle || slot->removing || !slot->listening || !slot->connected) continue;
 		slot->rumble.Update(ControllerReadRumbleRequest(slot->token));
-		if (QueueRumble(slot, now)) {
+		// Pad pulses are short and time-sensitive; rumble follows on completion.
+		if (QueueHaptic(slot, now) || QueueRumble(slot, now)) {
 			g_nextRumbleSlot = (i + 1) % kSlotCount;
 		}
 	}
@@ -595,12 +663,16 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 		}
 		TritonProtocol::ControllerState report;
 		TritonProtocol::ConvertToControllerState(input, &report);
+		TritonProtocol::RightPadState rightPad;
+		TritonProtocol::RightPadState* rightPadPointer =
+			TritonProtocol::DecodeRightPad(slot->inputBuffer, received, &rightPad) ?
+			&rightPad : 0;
 		bool wasConnected = slot->connected;
 		slot->connected = true;
 		slot->heartbeatEnabled = true;
 		if (!wasConnected)
 			slot->heartbeatDeadline = 0;
-		ControllerPublishState(slot->token, report);
+		ControllerPublishState(slot->token, report, rightPadPointer, GetTickCount());
 	} else if (slot->kind == ControllerUsbPolicy::kProteus && TritonProtocol::DecodeWirelessStatus(slot->inputBuffer, received, &wireless)) {
 		if (wireless == TritonProtocol::kWirelessDisconnected) {
 			slot->connected = false;

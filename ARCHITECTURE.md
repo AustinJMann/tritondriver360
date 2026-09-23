@@ -14,6 +14,8 @@ topologies and removal stress testing remain outstanding.
 | `hiddriver/main.cpp` | Plugin startup, kernel and XAM hooks, virtual controller ownership, input publication, title profiles, and worker threads. |
 | `hiddriver/controller_usb.cpp`, `controller_usb.h` | USB slot lifecycle, endpoint setup, asynchronous transfers, raw-mode heartbeats, rumble delivery, retries, and removal. |
 | `hiddriver/triton_protocol.cpp`, `triton_protocol.h` | Platform-independent report decoding, byte-order conversion, controller state mapping, and feature/rumble report encoding. |
+| `hiddriver/trackpad_motion.*`, `trackball_motion.*`, `mouse_joystick.*` | Portable right-pad normalization, release estimation, finite coasting, filtering, and stick conversion. |
+| `hiddriver/input_processing.*`, `trackpad_haptics.*` | Per-source composition, physical-stick priority, click contribution, transport-neutral haptic scheduling, intensity-to-gain mapping, and the one-pulse haptic mailbox. |
 | `hiddriver/controller_routing.h` | Shared slot, binding, generation, and guide-button timing checks. |
 | `hiddriver/controller_usb_policy.h`, `triton_hid_descriptor.h` | Transport admission, connection policies, and wired HID report validation. |
 | `hiddriver/rumble_output.h` | Rumble routing policy, configurable intensity scaling, generation-tagged requests, refresh timing, and retry state. |
@@ -25,6 +27,7 @@ topologies and removal stress testing remain outstanding.
 | `hiddriver/Detours.cpp`, `Detours.h` | PowerPC function interception and trampolines. |
 | `hiddriver/xkelib/` | Xbox kernel and XAM declarations and supporting library. |
 | `hiddriver/xex.xml` | System-plugin image settings. |
+| `docs/configuration.md` | User reference for `tritonconfig.yml`. Update it with any config key, range, or default change. |
 | `tests/` | Desktop tests for portable logic and a manifest for future hardware captures. |
 | `vs2022/` | Visual Studio integration for the Xbox 360 SDK toolchain. |
 
@@ -52,14 +55,20 @@ checks prevent stale bindings and rumble requests from reaching a new connection
    transport obtains descriptors, opens endpoints, and queues interrupt input.
 2. USB completion callbacks decode reports through `TritonProtocol` and publish
    controller state to `main.cpp`. Wireless disconnects schedule unbinding.
-3. The binding worker assigns connected slots to virtual controllers. Input
-   hooks read a consistent state snapshot, apply the active paddle mappings,
-   and provide Xbox input state. Capability hooks describe supported controls.
+3. The serialized input/service context applies the active profile, optional
+   right-pad motion, click and paddle bindings, and physical-stick priority,
+   then publishes a consistent composed snapshot. The binding worker assigns
+   connected slots to virtual controllers. Input hooks only read snapshots and
+   provide Xbox input state. Capability hooks describe supported controls.
 4. The XAM rumble hook finds the owning virtual controller, applies the active
    rumble settings, and publishes an atomic, generation-tagged request.
 5. USB maintenance sends encoded rumble reports, refreshes active effects, and
    retries failures. It also sends periodic lizard-off feature reports to keep
    the controller in raw input mode.
+6. Right-pad processing emits movement/swipe, click, and click-release haptic
+   requests. `main.cpp` converts them to a gain and stores them in a
+   per-source, generation-tagged mailbox. USB dispatch takes the pulse and
+   sends it as report `0x82`.
 
 Native input calls are forwarded when the request does not belong to a virtual
 controller. Rumble uses an interrupt output endpoint when available, with control
@@ -71,6 +80,8 @@ each wired device has its own arbiter.
 - USB maintenance runs on hardware thread 2 at IRQL 2, serialized with USB
   completion DPCs. It must remain nonblocking and retain transfer ownership until
   completion callbacks release it.
+- Right-pad processing uses floating-point math. Both USB completion and service
+  paths save and restore the Xbox DPC floating-point state around that work.
 - A separate binding worker on hardware thread 4 performs potentially blocking
   XAM operations and checks title changes. It does not hold up rumble refreshes.
 - Input publication uses two state buffers, a sequence counter, memory barriers,
@@ -82,9 +93,32 @@ each wired device has its own arbiter.
   the grace period does not prove the kernel has released storage.
   Kernel-observed structure offsets must stay intact.
 
-Configuration is loaded once at startup. The binding worker selects the global
-or per-title profile as titles change; editing the file requires a plugin reload
-or console restart. Parsing and mapping stay independent of Xbox file I/O.
+Configuration is loaded at startup and reloaded by the binding worker on each
+later title change, before it selects the global or per-title profile. Reloads
+use the startup search order but never create files. They parse into a separate
+buffer and replace the live config only on success. A missing, invalid, or
+locked file (sharing violation) keeps the current settings. A locked or invalid
+USB file still shadows `Hdd1:`. The worker is created with a 64 KB stack
+because the parser keeps a `Config` on the stack.
+
+The live config is copied in place while the profile epoch is odd. Readers
+copy a profile or rumble settings between two even epoch reads, with memory
+barriers, and discard the copy when the epoch changed. Parsing and mapping stay
+independent of Xbox file I/O.
+
+Right-pad processing state belongs to the physical source token, not the XAM
+player. Input completions consume coordinate/contact/click samples, while the
+USB service advances coast decay from absolute release time even without new
+reports. Profile epochs are copied on that serialized context; switching a
+profile resets contact filters, coast, click edges, and haptic phase before a
+new composed snapshot is published. Disconnect and attachment-epoch changes
+also reset the processor. Physical input is retained separately so service
+ticks never remap an already-composed snapshot.
+
+Minimum stick output applies only to the dominant axis. During a coast the
+release direction selects that axis, because the per-axis decay times differ
+and it could otherwise switch mid-coast. The vertical friction scale is applied
+before the duration bounds, so both coast durations respect them.
 
 ## Build and validation
 
@@ -103,6 +137,9 @@ if ($LASTEXITCODE -eq 0) { & .\tests\x64\Release\triton_protocol_tests.exe }
 
 Tests cover protocol validation and encoding, USB descriptors, routing,
 capabilities, configuration, paddle bindings, and rumble scaling/scheduling.
+They also cover right-pad decoding, filtering and hysteresis, release history,
+trackball curves/timing, physical-stick composition, click bindings, the
+transport-neutral haptic scheduler, gain mapping, and pulse mailbox priority/expiry.
 The protocol suite compiles portable protocol/configuration sources and shared
 headers. A separate Win32 harness compiles the real USB transport against a fake
 kernel, retaining the 32-bit ABI assertions and controlling completion order.
@@ -212,6 +249,12 @@ Protocol references inspected on 2026-09-21:
 - [SDL controller IDs](https://github.com/libsdl-org/SDL/blob/09b86eb7df3cfae1f0c3bab5b948f6120f1e386b/src/joystick/controller_list.h): Triton USB 1302, BLE 1303, and Proteus 1304.
 - [Linux HID Steam driver, revision 93f51579](https://github.com/torvalds/linux/blob/93f51579e7df248780214094418f205253383cc5/drivers/hid/hid-steam.c): descriptor-based interface selection, numbered controller feature reports, and HID output handling. No Linux implementation code is copied.
 
+Additional protocol evidence inspected on 2026-09-22:
+
+- [SDL Triton driver and controller structures](https://github.com/libsdl-org/SDL/tree/main/src/joystick/hidapi): state reports `0x42`/`0x45`, timestamped report `0x47`, right-pad touch/click bits, signed pad coordinates, orientation, and bounded report lengths. The decoder accepts the 18-byte basic prefix without assuming the optional extension is present.
+- [SDL controller structures](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/steam/controller_structs.h): packed `OutputReportMsg` with `MsgHapticCommand` (`side`, `command`, `gain_db`) as report `0x82`. SDL sends output reports as `1 + sizeof(payload)` bytes, matching the validated 10-byte `0x80` report, so `0x82` is 4 bytes.
+- [sc2-research HAPTICS.md](https://github.com/CouchTurtle/sc2-research/blob/main/docs/HAPTICS.md) (iczero's reverse engineering, inspected 2026-09-22): for `0x82`, side 0/1 are the left/right trackpads (`0x81` uses a different order); commands 1/2 are click/strong click; gain is clamped to -23..24 dB. Report `0x81` has no gain field, so it cannot carry intensity.
+
 The Win32 transport harness is built separately:
 
 ```powershell
@@ -221,9 +264,10 @@ if ($LASTEXITCODE -eq 0) { & .\tests\Release\controller_usb_tests.exe }
 
 It covers wired startup without input, repeated heartbeat failures, short input,
 wireless-status isolation, input recovery, eight USB sources, independent device
-arbiters, puck control sharing, rumble paths, descriptor rejection, configuration
-selection/retry, retirement acknowledgment, and late completions. Test descriptors
-are synthetic and are not stored as hardware fixtures.
+arbiters, puck control sharing, rumble and pad haptic paths, descriptor
+rejection, configuration selection/retry, retirement acknowledgment, and late
+completions. Test descriptors are synthetic and are not stored as hardware
+fixtures.
 
 Basic direct USB operation was confirmed on 2026-09-21. Remaining hardware
 coverage includes cold boot/hotplug, multiple wired controllers,
@@ -233,3 +277,36 @@ reconnects and memory growth, and recovery when player positions become free.
 Cable insertion is a reconnect; stable player migration and cross-transport
 identity deduplication are not implemented. If one physical controller streams
 on USB and wireless simultaneously, it may occupy two player positions.
+
+## Right-pad haptics
+
+Each scheduler update emits at most one pulse. Movement ticks occur at a rate
+proportional to speed, both while the finger moves and while a swipe coasts.
+Contact motion below the noise threshold is silent, and physical-stick takeover
+stops coast ticks with the coast.
+Each pad-click press emits one click pulse and each release one lighter release
+pulse. Processing runs only in `mouse_joystick` mode. Intensity is an amplitude
+fraction of the firmware maximum: `gain_db = 24 + 20*log10(intensity)`, clamped
+to -23..24. Defaults are movement/swipe 0.25 (+12 dB), press 0.7 (+21 dB), and
+release 0.35 (+15 dB). The press uses `CLICK_STRONG`; movement and release use
+`CLICK`.
+
+Requests are produced on the serialized USB context (input DPC or service
+tick) and converted to gain while DPC floating-point state is saved. The
+per-source mailbox holds a single pulse. Newer movement replaces older movement,
+but never a pending press or release pulse. Pulses older than 25 ms are dropped.
+Pulses require a current player binding and are rejected after the binding
+generation changes. Disconnect clears the mailbox.
+
+Rumble and haptics share one interrupt-OUT TRB (`OutputTransfer`) or, without
+it, endpoint zero. Only one is in flight per source. Dispatch tries a pending
+pulse before rumble; completion immediately re-dispatches, so rumble refresh is
+delayed by at most one short transfer. Haptic failures are logged and never
+retried. Wired sources enable haptics only if the HID descriptor declares output
+report `0x82` with 3 payload bytes; this is optional and never affects
+admission. Proteus descriptors are not fetched, so puck slots always send the
+SDL-sized report.
+
+Unverified on hardware: side mapping, perceived strength at each gain, whether
+`0x82` interrupts or mixes with `0x80` rumble on the same actuators, puck
+forwarding of `0x82`, and practical pulse-rate limits.

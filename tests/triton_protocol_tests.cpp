@@ -9,6 +9,11 @@
 #include "../hiddriver/controller_capabilities.h"
 #include "../hiddriver/rumble_output.h"
 #include "../hiddriver/triton_config.h"
+#include "../hiddriver/mouse_joystick.h"
+#include "../hiddriver/trackball_motion.h"
+#include "../hiddriver/trackpad_motion.h"
+#include "../hiddriver/trackpad_haptics.h"
+#include "../hiddriver/input_processing.h"
 
 #include "../hiddriver/triton_protocol.h"
 #include "../hiddriver/controller_routing.h"
@@ -313,6 +318,12 @@ static void TestButtonsAndTriggers() {
 	assert(b.r4 && b.r5 && b.l4 && b.l5);
 }
 
+static bool Near(float left, float right, float tolerance = 0.0001f) {
+	float difference = left - right;
+	if (difference < 0.0f) difference = -difference;
+	return difference <= tolerance;
+}
+
 static void TestConfigDefaultsAndBlackOpsProfile() {
 	TritonConfig::Config config;
 	TritonConfig::ParseError error = {};
@@ -326,6 +337,20 @@ static void TestConfigDefaultsAndBlackOpsProfile() {
 	assert(defaults->rumble.leftGainPermille == 2000);
 	assert(defaults->rumble.rightGainPermille == 2000);
 	assert(defaults->rumble.curve == RumbleOutput::kCurveCubic);
+	assert(Near(defaults->mouseJoystick.sensitivityX, 0.5f));
+	assert(Near(defaults->mouseJoystick.sensitivityY, 0.5f));
+	assert(Near(defaults->mouseJoystick.minimumOutputX, 0.2f));
+	assert(Near(defaults->mouseJoystick.minimumOutputY, 0.2f));
+	assert(defaults->mouseJoystick.smoothingMs == 8);
+	assert(Near(defaults->mouseJoystick.noiseSpeedThreshold, 0.2f));
+	assert(defaults->rightTrackpad.mode == TritonConfig::kRightTrackpadMouseJoystick);
+	assert(defaults->rightTrackpad.clickAction == TritonConfig::kBindingRightStick);
+	assert(defaults->rightTrackpad.trackball.curve == TrackballMotion::kCurveEaseOutCubic);
+	assert(Near(defaults->rightTrackpad.trackball.frictionStrength, 3.0f));
+	assert(Near(defaults->rightTrackpad.trackball.frictionMaxSpeed, 6.0f));
+	assert(defaults->rightTrackpad.trackball.frictionReferenceMs == 150);
+	assert(defaults->rightTrackpad.trackball.frictionMinMs == 30);
+	assert(defaults->rightTrackpad.trackball.frictionMaxMs == 300);
 	const TritonConfig::Profile* blackOps = TritonConfig::FindProfile(config, 0x415608C3);
 	assert(blackOps != defaults);
 	assert(blackOps->paddles[TritonConfig::kPaddleR4] == TritonConfig::kBindingX);
@@ -385,6 +410,11 @@ static void TestConfigOverridesAndValidation() {
 	const char overflowingVersion[] = "version: 4294967297\n";
 	assert(!TritonConfig::Parse(overflowingVersion,
 		sizeof(overflowingVersion) - 1, &config, &error));
+	// Reloads keep the previous config when a new file fails to parse.
+	profile = TritonConfig::FindProfile(config, 0xdeadbeef);
+	assert(config.gameCount == 1);
+	assert(profile->paddles[TritonConfig::kPaddleR4] == TritonConfig::kBindingDpadUp);
+	assert(config.defaults.rumble.leftGainPermille == 1250);
 }
 
 static void TestStatusAndFeature() {
@@ -869,6 +899,21 @@ static void TestTritonHidDescriptors() {
 	assert(!TritonHidDescriptor::Validate(bad, sizeof(bad)));
 	memcpy(bad, hid, sizeof(hid)); bad[0] = 0xfe;
 	assert(!TritonHidDescriptor::Validate(bad, sizeof(bad)));
+	bool haptic = true;
+	assert(TritonHidDescriptor::Validate(hid, sizeof(hid), &haptic) && !haptic);
+	const uint8_t withHaptic[] = {
+		0x06, 0, 0xff, 0x09, 1, 0xa1, 1, 0x75, 8,
+		0x85, 0x42, 0x95, 63, 0x81, 2,
+		0x85, 1, 0x95, 63, 0xb1, 2,
+		0x85, 0x80, 0x95, 9, 0x91, 2,
+		0x85, 0x82, 0x95, 3, 0x91, 2, 0xc0
+	};
+	assert(TritonHidDescriptor::Validate(withHaptic, sizeof(withHaptic), &haptic) && haptic);
+	uint8_t otherHaptic[sizeof(withHaptic)]; memcpy(otherHaptic, withHaptic, sizeof(withHaptic));
+	otherHaptic[30] = 4; // Unexpected layout disables haptics, not the controller.
+	assert(TritonHidDescriptor::Validate(otherHaptic, sizeof(otherHaptic), &haptic) && !haptic);
+	haptic = true; // Truncated descriptors report no haptic support.
+	assert(!TritonHidDescriptor::Validate(withHaptic, sizeof(withHaptic) - 1, &haptic) && !haptic);
 	const uint8_t configuration[] = {
 		9, 2, 27, 0, 1, 1, 0, 0x80, 50,
 		9, 4, 0, 0, 1, 3, 0, 0, 0,
@@ -880,7 +925,400 @@ static void TestTritonHidDescriptors() {
 		assert(UsbDescriptors::HidReportLength(configuration, i, 0) == 0);
 }
 
+static void TestRightPadDecoding() {
+	uint8_t report[64] = {};
+	report[0] = 0x45;
+	report[1] = 37;
+	Put32(report + 2, 0x00200000 | 0x00400000);
+	Put16(report + 24, (uint16_t)-1234);
+	Put16(report + 26, 2345);
+	Put16(report + 28, 30000);
+	RightPadState pad = {};
+	assert(DecodeRightPad(report, 18, &pad));
+	assert(pad.sequence == 37 && pad.contact && pad.click && !pad.coordinatesValid);
+	assert(DecodeRightPad(report, 30, &pad));
+	assert(pad.coordinatesValid && !pad.timestampValid);
+	assert(pad.x == -1234 && pad.y == 2345 && pad.pressure == 30000);
+	report[0] = 0x47;
+	Put16(report + 18, 0xfffe);
+	Put16(report + 26, 111);
+	Put16(report + 28, (uint16_t)-222);
+	Put16(report + 30, 333);
+	assert(DecodeRightPad(report, 31, &pad));
+	assert(!pad.coordinatesValid && !pad.timestampValid);
+	assert(DecodeRightPad(report, 32, &pad));
+	assert(pad.coordinatesValid && pad.timestampValid && pad.timestamp == 0xfffe);
+	assert(pad.x == 111 && pad.y == -222 && pad.pressure == 333);
+	RightPadState unchanged = pad;
+	report[0] = 0x43;
+	assert(!DecodeRightPad(report, sizeof(report), &unchanged));
+	assert(unchanged.x == 111);
+}
+
+static void TestMouseJoystickConversionAndFiltering() {
+	MouseJoystick::Settings settings = MouseJoystick::DefaultSettings();
+	settings.smoothingMs = 0;
+	settings.noiseSpeedThreshold = 0.1f;
+	settings.sensitivityX = 2.0f;
+	settings.sensitivityY = 1.0f;
+	settings.minimumOutputX = 0.2f;
+	settings.minimumOutputY = 0.3f;
+	MouseJoystick::Processor processor;
+	MouseJoystick::Vector2 velocity = { 0.11f, 0.0f };
+	MouseJoystick::Output output = processor.Update(velocity, 10, settings);
+	assert(Near(output.x, 0.376f) && output.y == 0.0f);
+	velocity.x = 0.08f;
+	output = processor.Update(velocity, 10, settings);
+	assert(output.x > 0.0f); // Hysteresis remains active above 75%.
+	velocity.x = 0.07f;
+	output = processor.Update(velocity, 10, settings);
+	assert(output.x == 0.0f && !processor.IsMoving());
+	velocity.x = -2.0f; velocity.y = 2.0f;
+	output = processor.Update(velocity, 10, settings);
+	assert(output.x == -1.0f && output.y == 1.0f);
+	assert(MouseJoystick::Processor::ToStickAxis(output.x) == -32768);
+	assert(MouseJoystick::Processor::ToStickAxis(output.y) == 32767);
+	settings.noiseSpeedThreshold = 0.0f;
+	settings.minimumOutputX = 0.5f;
+	velocity.x = velocity.y = 0.0f;
+	processor.Reset();
+	output = processor.Update(velocity, 10, settings);
+	assert(output.x == 0.0f); // A minimum output never turns rest into motion.
+	settings.smoothingMs = 8;
+	settings.sensitivityX = 1.0f;
+	velocity.x = 1.0f;
+	output = processor.Update(velocity, 8, settings);
+	assert(Near(output.x, 0.75f)); // Filtered 0.5, then 0.5 minimum compensation.
+
+	// Only the dominant axis receives the minimum output.
+	settings.sensitivityX = settings.sensitivityY = 0.5f;
+	settings.minimumOutputX = settings.minimumOutputY = 0.2f;
+	velocity.x = 1.0f; velocity.y = -0.1f;
+	output = MouseJoystick::Processor::Convert(velocity, velocity, settings);
+	assert(Near(output.x, 0.6f) && Near(output.y, -0.05f));
+	velocity.x = 0.1f; velocity.y = 1.0f;
+	output = MouseJoystick::Processor::Convert(velocity, velocity, settings);
+	assert(Near(output.x, 0.05f) && Near(output.y, 0.6f));
+	velocity.x = velocity.y = 0.5f;
+	output = MouseJoystick::Processor::Convert(velocity, velocity, settings);
+	assert(Near(output.x, 0.4f) && Near(output.y, 0.4f)); // Ties raise both.
+	// An explicit direction, such as a coast's release velocity, picks the axis.
+	MouseJoystick::Vector2 direction = { 1.0f, 0.1f };
+	velocity.x = 0.01f; velocity.y = 0.05f;
+	output = MouseJoystick::Processor::Convert(velocity, direction, settings);
+	assert(Near(output.x, 0.204f) && Near(output.y, 0.025f));
+}
+
+static void TestTrackpadContactAndRelease() {
+	TrackpadMotion::Processor pad;
+	TrackpadMotion::Geometry geometry = { 0, 1000, 0, 1000, false, true };
+	pad.SetGeometry(geometry);
+	TrackpadMotion::Result result = pad.Sample(true, 100, 500, 100);
+	assert(!result.hasContactVelocity && !result.released);
+	result = pad.Sample(true, 150, 500, 100); // Duplicate timestamp accumulates.
+	assert(!result.hasContactVelocity);
+	result = pad.Sample(true, 200, 400, 110);
+	assert(result.hasContactVelocity && Near(result.contactVelocity.x, 10.0f));
+	assert(Near(result.contactVelocity.y, 10.0f));
+	result = pad.Sample(true, 200, 400, 130); // Rest is part of release history.
+	assert(result.hasContactVelocity && result.contactVelocity.x == 0.0f);
+	result = pad.Sample(false, 999, 999, 140);
+	assert(result.released);
+	assert(Near(result.releaseVelocity.x, 10.0f / 3.0f, 0.001f));
+	assert(!pad.HasContact());
+	result = pad.Sample(true, 300, 300, 200);
+	assert(!result.hasContactVelocity); // Recontact establishes a new baseline.
+	assert(pad.Expire(301, 100));
+	assert(!pad.HasContact());
+}
+
+static void TestTrackballCurvesAndTiming() {
+	TrackballMotion::Settings settings = TrackballMotion::DefaultSettings();
+	TrackballMotion::Processor coast;
+	MouseJoystick::Vector2 release = { 1.0f, 0.0f };
+	for (int power = 1; power <= 4; ++power) {
+		settings.curve = (TrackballMotion::Curve)power;
+		assert(coast.Start(release, 1000, settings, 0.015f));
+		MouseJoystick::Vector2 velocity = coast.Advance(1225);
+		float expected = 1.0f;
+		for (int i = 0; i < power; ++i) expected *= 0.5f;
+		assert(Near(velocity.x, expected, 0.0002f));
+		assert(velocity.y == 0.0f);
+	}
+	MouseJoystick::Vector2 velocity = coast.Advance(1450);
+	assert(velocity.x == 0.0f && velocity.y == 0.0f && !coast.IsCoasting());
+	settings.curve = TrackballMotion::kCurveLinear;
+	settings.verticalScale = 1.0f;
+	release.y = 1.0f;
+	assert(coast.Start(release, 2000, settings, 0.0f));
+	velocity = coast.Advance(2450);
+	assert(velocity.x > 0.0f);
+	assert(velocity.y == 0.0f); // High vertical friction shortens the Y coast.
+	settings.verticalScale = 0.0f;
+	release.x = 0.0f;
+	assert(coast.Start(release, 3000, settings, 0.0f));
+	velocity = coast.Advance(3450);
+	// Low vertical friction extends the Y coast, but only to friction_max_ms.
+	assert(Near(velocity.y, 0.7f));
+	settings.frictionMaxMs = 10000 / 4;
+	assert(coast.Start(release, 3000, settings, 0.0f));
+	velocity = coast.Advance(3450);
+	assert(Near(velocity.y, 0.75f)); // Unclamped, Y lasts four times as long.
+	settings.frictionMaxMs = 1500;
+	settings.verticalScale = 1.0f;
+	release.x = release.y = 0.05f / 1.41421356f; // 22.5 ms before clamping.
+	assert(coast.Start(release, 3000, settings, 0.0f));
+	velocity = coast.Advance(3020);
+	// Both axes are raised to friction_min_ms (30 ms), even though Y alone
+	// would otherwise end at 13 ms.
+	assert(velocity.x > 0.0f && velocity.y > 0.0f);
+	assert(Near(velocity.x, velocity.y));
+	TrackballMotion::Processor direct, stepped;
+	release.x = 1.0f; release.y = 0.0f;
+	settings.verticalScale = 0.5f;
+	assert(direct.Start(release, 4000, settings, 0.0f));
+	assert(stepped.Start(release, 4000, settings, 0.0f));
+	stepped.Advance(4100);
+	stepped.Advance(4175);
+	assert(Near(direct.Advance(4225).x, stepped.Advance(4225).x));
+	settings.frictionMaxSpeed = 2.0f;
+	release.x = 4.0f;
+	assert(coast.Start(release, 5000, settings, 0.0f));
+	velocity = coast.Advance(5900);
+	assert(Near(velocity.x, 0.0f)); // The capped speed gives a 900 ms duration.
+	assert(!coast.IsCoasting());
+	coast.Reset();
+	settings.enabled = false;
+	assert(!coast.Start(release, 0, settings, 0.0f));
+}
+
+static void TestTrackpadHapticScheduling() {
+	TrackpadHaptics::Settings settings = TrackpadHaptics::DefaultSettings();
+	TrackpadHaptics::Scheduler scheduler;
+	const float fast = settings.fullSpeed;
+	TrackpadHaptics::Request request = scheduler.Update(fast, false, false, 10, settings);
+	assert(request.kind == TrackpadHaptics::kRequestNone);
+	request = scheduler.Update(fast, false, false, 10, settings);
+	assert(request.kind == TrackpadHaptics::kRequestMovement);
+	request = scheduler.Update(fast, true, false, 100, settings);
+	assert(request.kind == TrackpadHaptics::kRequestClick);
+	request = scheduler.Update(fast, false, false, 1000, settings);
+	assert(request.kind == TrackpadHaptics::kRequestMovement); // One, not a burst.
+	settings.movementIntensity = 0.0f;
+	request = scheduler.Update(fast, false, false, 1000, settings);
+	assert(request.kind == TrackpadHaptics::kRequestNone);
+	request = scheduler.Update(0.0f, true, false, 1, settings);
+	assert(request.kind == TrackpadHaptics::kRequestClick);
+	request = scheduler.Update(0.0f, false, true, 1, settings);
+	assert(request.kind == TrackpadHaptics::kRequestRelease);
+	assert(Near(request.intensity, settings.releaseIntensity));
+	assert(settings.releaseIntensity < settings.clickIntensity); // Lighter than the press.
+	settings.releaseIntensity = 0.0f;
+	request = scheduler.Update(0.0f, false, true, 1, settings);
+	assert(request.kind == TrackpadHaptics::kRequestNone); // Release can be muted alone.
+}
+
+static void TestTrackpadHapticGainAndMailbox() {
+	using namespace TrackpadHaptics;
+	Settings defaults = DefaultSettings();
+	assert(Near(defaults.movementIntensity, 0.25f));
+	assert(Near(defaults.clickIntensity, 0.7f));
+	assert(Near(defaults.releaseIntensity, 0.35f) && GainDb(0.35f) == 15);
+	assert(GainDb(1.0f) == kMaximumGainDb && GainDb(2.0f) == kMaximumGainDb);
+	assert(GainDb(0.25f) == 12); // A quarter of maximum amplitude.
+	assert(GainDb(0.5f) == 18 && GainDb(0.7f) == 21);
+	assert(GainDb(0.001f) == kMinimumGainDb && GainDb(0.0f) == kMinimumGainDb);
+	Mailbox mailbox;
+	Pulse pulse = {};
+	assert(!mailbox.Take(0, &pulse));
+	mailbox.Offer(kRequestMovement, 12, 3, 100);
+	mailbox.Offer(kRequestMovement, 11, 3, 105); // Newer movement replaces older.
+	assert(mailbox.Take(110, &pulse));
+	assert(pulse.kind == kRequestMovement && pulse.gainDb == 11 && pulse.generation == 3);
+	assert(!mailbox.Take(110, &pulse)); // One shot.
+	mailbox.Offer(kRequestClick, 21, 3, 200);
+	mailbox.Offer(kRequestMovement, 12, 3, 205); // Movement never hides a click.
+	assert(mailbox.Take(206, &pulse) && pulse.kind == kRequestClick);
+	mailbox.Offer(kRequestRelease, 15, 3, 250);
+	mailbox.Offer(kRequestMovement, 12, 3, 255); // Nor a release.
+	assert(mailbox.Take(256, &pulse) && pulse.kind == kRequestRelease && pulse.gainDb == 15);
+	mailbox.Offer(kRequestClick, 21, 3, 300);
+	mailbox.Offer(kRequestMovement, 12, 4, 301); // A new binding drops the old click.
+	assert(mailbox.Take(302, &pulse) && pulse.kind == kRequestMovement);
+	mailbox.Offer(kRequestClick, 21, 5, 0xfffffff0u);
+	assert(!mailbox.Take(0xfffffff0u + kMaximumPulseAgeMs + 1, &pulse));
+	assert(!mailbox.Take(0xfffffff0u, &pulse)); // Expired pulses are discarded.
+	mailbox.Offer(kRequestMovement, 12, 5, 0xfffffff0u);
+	assert(mailbox.Take(0xfffffff0u + kMaximumPulseAgeMs, &pulse)); // Clock wrap.
+	mailbox.Offer(kRequestNone, 0, 5, 1);
+	assert(!mailbox.Take(1, &pulse));
+	mailbox.Offer(kRequestClick, 21, 5, 1);
+	mailbox.Reset();
+	assert(!mailbox.Take(1, &pulse));
+}
+
+static void TestHapticCommandEncoding() {
+	uint8_t report[kHapticCommandReportSize + 2];
+	memset(report, 0xcc, sizeof(report));
+	BuildHapticCommandReport(kHapticSideRightPad, kHapticClick, 12, report + 1);
+	const uint8_t expected[] = { 0x82, 1, 1, 12 };
+	assert(memcmp(report + 1, expected, sizeof(expected)) == 0);
+	assert(report[0] == 0xcc && report[sizeof(report) - 1] == 0xcc);
+	BuildHapticCommandReport(kHapticSideRightPad, kHapticClickStrong, -23, report);
+	assert(report[2] == 2 && report[3] == 0xe9);
+}
+
+static void TestMouseJoystickConfiguration() {
+	const char text[] =
+		"games:\n"
+		"  '1234ABCD':\n"
+		"    mouse_joystick:\n"
+		"      sensitivity_x: 3.5\n"
+		"    right_trackpad:\n"
+		"      mode: mouse_joystick\n"
+		"      click_action: right_stick\n"
+		"      friction_min_ms: 100\n"
+		"      friction_max_speed: 2.5\n"
+		"      release_haptics_intensity: 0.2\n"
+		"version: 1\n"
+		"defaults:\n"
+		"  mouse_joystick:\n"
+		"    sensitivity_x: 1.25\n"
+		"    sensitivity_y: 2.0\n"
+		"    minimum_output_x: 0.15\n"
+		"    smoothing_ms: 12\n"
+		"  right_trackpad:\n"
+		"    friction_max_ms: 900\n"
+		"    haptics_full_speed: 4.0\n";
+	TritonConfig::Config config;
+	TritonConfig::ParseError error = {};
+	assert(TritonConfig::Parse(text, sizeof(text) - 1, &config, &error));
+	const TritonConfig::Profile* defaults = TritonConfig::FindProfile(config, 0);
+	const TritonConfig::Profile* game = TritonConfig::FindProfile(config, 0x1234abcd);
+	assert(Near(defaults->mouseJoystick.sensitivityX, 1.25f));
+	assert(Near(defaults->mouseJoystick.sensitivityY, 2.0f));
+	assert(Near(game->mouseJoystick.sensitivityX, 3.5f));
+	assert(Near(game->mouseJoystick.sensitivityY, 2.0f));
+	assert(game->rightTrackpad.mode == TritonConfig::kRightTrackpadMouseJoystick);
+	assert(game->rightTrackpad.clickAction == TritonConfig::kBindingRightStick);
+	assert(game->rightTrackpad.trackball.frictionMinMs == 100);
+	assert(game->rightTrackpad.trackball.frictionMaxMs == 900);
+	assert(Near(defaults->rightTrackpad.trackball.frictionMaxSpeed, 0.0f));
+	assert(Near(game->rightTrackpad.trackball.frictionMaxSpeed, 2.5f));
+	assert(Near(defaults->rightTrackpad.haptics.releaseIntensity, 0.35f));
+	assert(Near(game->rightTrackpad.haptics.releaseIntensity, 0.2f));
+	assert(Near(game->rightTrackpad.haptics.clickIntensity, 0.7f));
+	ControllerState state = {};
+	TritonConfig::ApplyBinding(game->rightTrackpad.clickAction, &state);
+	assert(state.rightStick);
+	const char badRange[] = "version: 1\ndefaults:\n  mouse_joystick:\n    sensitivity_x: 20.001\n";
+	assert(!TritonConfig::Parse(badRange, sizeof(badRange) - 1, &config, &error));
+	const char badCrossField[] = "version: 1\ndefaults:\n  right_trackpad:\n    friction_min_ms: 31\n    friction_max_ms: 30\n";
+	assert(!TritonConfig::Parse(badCrossField, sizeof(badCrossField) - 1, &config, &error));
+	const char duplicate[] = "version: 1\ndefaults:\n  mouse_joystick:\n    sensitivity_x: 1\n    sensitivity_x: 2\n";
+	assert(!TritonConfig::Parse(duplicate, sizeof(duplicate) - 1, &config, &error));
+	const char badRelease[] = "version: 1\ndefaults:\n  right_trackpad:\n    release_haptics_intensity: 1.001\n";
+	assert(!TritonConfig::Parse(badRelease, sizeof(badRelease) - 1, &config, &error));
+}
+
+static void TestRightTrackpadCoordinator() {
+	TritonConfig::Config config;
+	TritonConfig::Initialize(&config);
+	TritonConfig::Profile profile = config.defaults;
+	profile.rightTrackpad.mode = TritonConfig::kRightTrackpadMouseJoystick;
+	profile.rightTrackpad.clickAction = TritonConfig::kBindingA;
+	profile.mouseJoystick.smoothingMs = 0;
+	profile.mouseJoystick.noiseSpeedThreshold = 0.0f;
+	profile.mouseJoystick.sensitivityX = 0.1f;
+	profile.rightTrackpad.haptics.movementIntensity = 0.0f;
+	InputProcessing::RightTrackpadProcessor processor;
+	TrackpadMotion::Geometry geometry = { 0, 1000, 0, 1000, false, false };
+	processor.SetGeometry(geometry);
+	processor.SetProfile(profile, false, false, 100);
+	ControllerState physical = {};
+	physical.rightX = 123;
+	InputProcessing::Output output = processor.ProcessSample(
+		physical, true, 100, 100, false, 100);
+	assert(output.state.rightX == 0 && output.padActive); // Touchdown cannot jump.
+	output = processor.ProcessSample(physical, true, 200, 100, true, 110);
+	assert(output.state.rightX == 32767 && output.state.a);
+	assert(output.haptic.kind == TrackpadHaptics::kRequestClick);
+	output = processor.ProcessSample(physical, true, 200, 100, false, 120);
+	assert(!output.state.a); // Only the synthetic held contribution is released.
+	assert(output.haptic.kind == TrackpadHaptics::kRequestRelease);
+	output = processor.ProcessSample(physical, true, 200, 100, false, 125);
+	assert(output.haptic.kind == TrackpadHaptics::kRequestNone); // Once per release.
+	physical.rightX = 20000;
+	output = processor.ProcessSample(physical, true, 250, 100, false, 130);
+	assert(output.state.rightX == 20000); // Physical stick takes priority exactly.
+	physical.rightX = 0;
+	output = processor.ProcessSample(physical, true, 250, 200, false, 140);
+	assert(output.state.rightY == 32767); // Upward pad motion drives the camera up.
+	output = processor.ProcessSample(physical, false, 0, 0, false, 150);
+	assert(output.padActive); // A recent release starts a coast.
+	output = processor.Advance(2000);
+	assert(!output.padActive && output.state.rightX == 0);
+	profile.rightTrackpad.mode = TritonConfig::kRightTrackpadDisabled;
+	processor.SetProfile(profile, false, false, 3000);
+	physical.rightX = 42;
+	output = processor.ProcessSample(physical, true, 900, 900, true, 3010);
+	assert(output.state.rightX == 42 && !output.state.a && !output.padActive);
+}
+
+static void TestRightTrackpadMovementHaptics() {
+	TritonConfig::Config config;
+	TritonConfig::Initialize(&config);
+	TritonConfig::Profile profile = config.defaults;
+	profile.rightTrackpad.mode = TritonConfig::kRightTrackpadMouseJoystick;
+	profile.mouseJoystick.smoothingMs = 0;
+	profile.mouseJoystick.noiseSpeedThreshold = 0.5f;
+	profile.rightTrackpad.haptics.maximumHz = 100;
+	profile.rightTrackpad.haptics.fullSpeed = 1.0f;
+	InputProcessing::RightTrackpadProcessor processor;
+	TrackpadMotion::Geometry geometry = { 0, 1000, 0, 1000, false, false };
+	processor.SetGeometry(geometry);
+	processor.SetProfile(profile, false, false, 0);
+	ControllerState physical = {};
+	processor.ProcessSample(physical, true, 500, 500, false, 0);
+	for (uint32_t t = 10; t <= 500; t += 10) {
+		// Jitter of 0.1 pad widths/second stays below the noise threshold.
+		InputProcessing::Output output = processor.ProcessSample(physical, true,
+			500 + (int32_t)((t / 10) & 1), 500, false, t);
+		assert(output.haptic.kind == TrackpadHaptics::kRequestNone);
+	}
+	processor.ProcessSample(physical, false, 0, 0, false, 505);
+	int32_t x = 0;
+	processor.ProcessSample(physical, true, x, 500, false, 600);
+	bool moved = false;
+	for (uint32_t t = 610; t <= 640; t += 10) {
+		x += 50; // Five pad widths/second.
+		InputProcessing::Output output = processor.ProcessSample(physical, true, x, 500,
+			false, t);
+		moved = moved || output.haptic.kind == TrackpadHaptics::kRequestMovement;
+	}
+	assert(moved);
+	assert(processor.ProcessSample(physical, false, 0, 0, false, 650).padActive);
+	physical.rightX = 20000;
+	processor.UpdatePhysical(physical, 660); // Takeover cancels the coast.
+	physical.rightX = 0;
+	processor.UpdatePhysical(physical, 670);
+	for (uint32_t t = 675; t <= 1000; t += 5) {
+		InputProcessing::Output output = processor.Advance(t);
+		assert(!output.padActive);
+		assert(output.haptic.kind == TrackpadHaptics::kRequestNone);
+	}
+}
+
 int main() {
+	TestMouseJoystickConversionAndFiltering();
+	TestTrackpadContactAndRelease();
+	TestTrackballCurvesAndTiming();
+	TestTrackpadHapticScheduling();
+	TestTrackpadHapticGainAndMailbox();
+	TestHapticCommandEncoding();
+	TestMouseJoystickConfiguration();
+	TestRightTrackpadCoordinator();
+	TestRightTrackpadMovementHaptics();
 	TestWiredAdmissionAndSourceCapacity();
 	TestTritonHidDescriptors();
 	TestUsbOutputDescriptors();
@@ -898,6 +1336,7 @@ int main() {
 	TestAdmissionAndValidation();
 	TestStateIdsAndAxes();
 	TestButtonsAndTriggers();
+	TestRightPadDecoding();
 	TestStatusAndFeature();
 	TestRoutingConnectionOrders();
 	TestRoutingDisconnectRetryAndGeneration();
